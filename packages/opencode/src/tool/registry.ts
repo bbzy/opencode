@@ -9,7 +9,8 @@ import { EditTool } from "./edit"
 import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
-import { TaskTool } from "./task"
+import { TaskTool, ParametersWithoutModel, ParametersWithoutModelWithBackground, ParametersWithModel } from "./task"
+import { ToolJsonSchema } from "./json-schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
@@ -54,6 +55,8 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { McpCatalog } from "@/mcp/catalog"
+import { ConfigTaskModel } from "@/config/task-model"
+import { TaskModel } from "@/task-model"
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return (
@@ -274,7 +277,27 @@ const layer = Layer.effect(
             `- ${item.name}: ${item.description ?? "This subagent should only be called manually by the user."}`,
         )
         .join("\n")
-      return ["Available agent types and the tools they have access to:", description].join("\n")
+
+      const cfg = yield* config.get()
+      const taskModelConfig = cfg.task_model
+        ? yield* ConfigTaskModel.load().pipe(
+            Effect.catch((err) =>
+              Effect.gen(function* () {
+                yield* Effect.logError("task_model.json load failed", { error: String(err) })
+                return undefined
+              }),
+            ),
+          )
+        : undefined
+      const catalog = taskModelConfig ? TaskModel.describeCatalog(taskModelConfig) : undefined
+
+      return [
+        "Available agent types and the tools they have access to:",
+        description,
+        catalog,
+      ]
+        .filter(Boolean)
+        .join("\n\n")
     })
 
     const describeCodeMode = Effect.fn("ToolRegistry.describeCodeMode")(function* (input: {
@@ -289,6 +312,8 @@ const layer = Layer.effect(
     })
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
+      const cfg = yield* config.get()
+      const taskModelsDisabled = !cfg.task_model
       const filtered = (yield* all()).filter((tool) => {
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel })
@@ -314,6 +339,15 @@ const layer = Layer.effect(
             description: tool.description,
             parameters: tool.parameters,
             jsonSchema: tool.jsonSchema,
+          }
+          if (tool.id === TaskTool.id) {
+            if (taskModelsDisabled) {
+              output.jsonSchema = flags.experimentalBackgroundSubagents
+                ? ToolJsonSchema.fromSchema(ParametersWithoutModelWithBackground)
+                : ToolJsonSchema.fromSchema(ParametersWithoutModel)
+            } else {
+              output.jsonSchema = ToolJsonSchema.fromSchema(ParametersWithModel)
+            }
           }
           yield* plugin.trigger("tool.definition", { toolID: tool.id }, output)
           const jsonSchema =
