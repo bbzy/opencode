@@ -1,6 +1,6 @@
 import { afterEach, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Effect, Exit, Fiber, Layer, Queue } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer, Option, Queue } from "effect"
 import { Question } from "../../src/question"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { InstanceStore } from "../../src/project/instance-store"
@@ -63,6 +63,18 @@ const waitForPending = Effect.fn("QuestionTest.waitForPending")(function* (count
     if (pending.length === count) return pending
     yield* Queue.take(asked).pipe(Effect.timeout("2 seconds"))
   }
+})
+
+const watchRejected = Effect.fn("QuestionTest.watchRejected")(function* () {
+  const events = yield* EventV2Bridge.Service
+  const rejected = yield* Queue.unbounded<QuestionID>()
+  const off = yield* events.listen((event) => {
+    if (event.type !== Question.Event.Rejected.type) return Effect.void
+    Queue.offerUnsafe(rejected, (event.data as { sessionID: SessionID; requestID: QuestionID }).requestID)
+    return Effect.void
+  })
+  yield* Effect.addFinalizer(() => off)
+  return rejected
 })
 
 it.instance(
@@ -272,6 +284,86 @@ it.instance(
       if (Exit.isFailure(exit)) {
         expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "Question.NotFoundError", requestID: "que_unknown" })
       }
+    }),
+  { git: true },
+)
+
+// rejected-event publication tests
+
+it.instance(
+  "ask - publishes rejected event when interrupted",
+  () =>
+    Effect.gen(function* () {
+      const rejected = yield* watchRejected()
+      const fiber = yield* askEffect({
+        sessionID: SessionID.make("ses_interrupt"),
+        questions: [
+          {
+            question: "Interrupt me?",
+            header: "Interrupt",
+            options: [{ label: "Yes", description: "Yes" }],
+          },
+        ],
+      }).pipe(Effect.forkScoped)
+
+      const pending = yield* waitForPending(1)
+      yield* Fiber.interrupt(fiber)
+
+      const requestID = yield* Queue.take(rejected).pipe(Effect.timeout("2 seconds"))
+      expect(requestID).toBe(pending[0].id)
+      expect(yield* listEffect).toHaveLength(0)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "reply - does not publish rejected event",
+  () =>
+    Effect.gen(function* () {
+      const rejected = yield* watchRejected()
+      const fiber = yield* askEffect({
+        sessionID: SessionID.make("ses_reply_clean"),
+        questions: [
+          {
+            question: "Reply to me?",
+            header: "Reply",
+            options: [{ label: "Yes", description: "Yes" }],
+          },
+        ],
+      }).pipe(Effect.forkScoped)
+
+      const pending = yield* waitForPending(1)
+      yield* replyEffect({ requestID: pending[0].id, answers: [["Yes"]] })
+      yield* Fiber.join(fiber)
+
+      expect(Option.isNone(yield* Queue.poll(rejected))).toBe(true)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "reject - publishes exactly one rejected event",
+  () =>
+    Effect.gen(function* () {
+      const rejected = yield* watchRejected()
+      const fiber = yield* askEffect({
+        sessionID: SessionID.make("ses_reject_once"),
+        questions: [
+          {
+            question: "Reject me?",
+            header: "Reject",
+            options: [{ label: "Yes", description: "Yes" }],
+          },
+        ],
+      }).pipe(Effect.forkScoped)
+
+      const pending = yield* waitForPending(1)
+      yield* rejectEffect(pending[0].id)
+      yield* Fiber.await(fiber)
+
+      const requestID = yield* Queue.take(rejected).pipe(Effect.timeout("2 seconds"))
+      expect(requestID).toBe(pending[0].id)
+      expect(Option.isNone(yield* Queue.poll(rejected))).toBe(true)
     }),
   { git: true },
 )

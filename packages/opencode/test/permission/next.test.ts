@@ -1,7 +1,7 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { test, expect } from "bun:test"
 import os from "os"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Option, Queue } from "effect"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Permission } from "../../src/permission"
@@ -73,6 +73,21 @@ const list = () =>
     const permission = yield* Permission.Service
     return yield* permission.list()
   })
+
+const watchReplied = Effect.gen(function* () {
+  const events = yield* EventV2Bridge.Service
+  const replied = yield* Queue.unbounded<{ requestID: PermissionV1.ID; reply: PermissionV1.Reply }>()
+  const unsub = yield* events.listen((event) => {
+    if (event.type !== Permission.Event.Replied.type) return Effect.void
+    Queue.offerUnsafe(
+      replied,
+      event.data as { sessionID: SessionID; requestID: PermissionV1.ID; reply: PermissionV1.Reply },
+    )
+    return Effect.void
+  })
+  yield* Effect.addFinalizer(() => unsub)
+  return replied
+})
 
 // fromConfig tests
 
@@ -690,6 +705,86 @@ it.instance(
 
       yield* rejectAll()
       yield* Fiber.await(fiber)
+    }),
+  { git: true },
+)
+
+// replied-event publication tests
+
+it.instance(
+  "ask - publishes replied event when interrupted",
+  () =>
+    Effect.gen(function* () {
+      const replied = yield* watchReplied
+      const fiber = yield* ask({
+        sessionID: SessionID.make("session_interrupt"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+      }).pipe(Effect.forkScoped)
+
+      const pending = yield* waitForPending(1)
+      yield* Fiber.interrupt(fiber)
+
+      const event = yield* Queue.take(replied).pipe(Effect.timeout("2 seconds"))
+      expect(event.requestID).toBe(pending[0].id)
+      expect(event.reply).toBe("reject")
+      expect(yield* list()).toHaveLength(0)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "reply - does not publish extra replied events",
+  () =>
+    Effect.gen(function* () {
+      const replied = yield* watchReplied
+      const fiber = yield* ask({
+        id: PermissionV1.ID.make("per_clean"),
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+      }).pipe(Effect.forkScoped)
+
+      yield* waitForPending(1)
+      yield* reply({ requestID: PermissionV1.ID.make("per_clean"), reply: "once" })
+      yield* Fiber.join(fiber)
+
+      const event = yield* Queue.take(replied).pipe(Effect.timeout("2 seconds"))
+      expect(event.requestID).toBe(PermissionV1.ID.make("per_clean"))
+      expect(Option.isNone(yield* Queue.poll(replied))).toBe(true)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "reply - reject publishes exactly one replied event",
+  () =>
+    Effect.gen(function* () {
+      const replied = yield* watchReplied
+      const fiber = yield* ask({
+        id: PermissionV1.ID.make("per_reject_once"),
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+      }).pipe(Effect.forkScoped)
+
+      yield* waitForPending(1)
+      yield* reply({ requestID: PermissionV1.ID.make("per_reject_once"), reply: "reject" })
+      yield* Fiber.await(fiber)
+
+      const event = yield* Queue.take(replied).pipe(Effect.timeout("2 seconds"))
+      expect(event.requestID).toBe(PermissionV1.ID.make("per_reject_once"))
+      expect(event.reply).toBe("reject")
+      expect(Option.isNone(yield* Queue.poll(replied))).toBe(true)
     }),
   { git: true },
 )
