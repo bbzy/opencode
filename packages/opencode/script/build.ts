@@ -160,6 +160,8 @@ for (const item of targets) {
   const treeSitterWorkerPath = "opentui-tree-sitter-worker.js"
   const bunfsRoot = item.os === "win32" ? "B:/~BUN/root/" : "/$bunfs/root/"
 
+  const binaryPath = `dist/${name}/bin/opencode`
+
   await Bun.build({
     conditions: ["bun", "node"],
     tsconfig: "./tsconfig.json",
@@ -175,7 +177,7 @@ for (const item of targets) {
       autoloadTsconfig: true,
       autoloadPackageJson: true,
       target: name.replace(pkg.name, "bun") as any,
-      outfile: `dist/${name}/bin/opencode`,
+      outfile: binaryPath,
       execArgv: [`--user-agent=opencode/${Script.version}`, "--use-system-ca", "--"],
       windows: {},
     },
@@ -201,9 +203,13 @@ for (const item of targets) {
     },
   })
 
+  if (process.platform === "darwin" && item.os === "darwin") {
+    await $`codesign --remove-signature ${binaryPath}`.quiet().nothrow()
+    await $`codesign --force --sign - ${binaryPath}`
+  }
+
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {
-    const binaryPath = `dist/${name}/bin/opencode`
     console.log(`Running smoke test: ${binaryPath} --version`)
     try {
       const versionOutput = await $`${binaryPath} --version`.text()
