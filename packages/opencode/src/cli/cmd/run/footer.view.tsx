@@ -242,6 +242,7 @@ export function RunFooterView(props: RunFooterViewProps) {
   const busy = createMemo(() => props.state().phase === "running")
   const armed = createMemo(() => props.state().interrupt > 0)
   const exiting = createMemo(() => props.state().exit > 0)
+  const loopLabel = createMemo(() => props.state().loop ?? "")
   const queue = createMemo(() => props.state().queue)
   const usage = createMemo(() => props.state().usage)
   const interruptLabel = createMemo(() => {
@@ -911,6 +912,21 @@ export function RunFooterView(props: RunFooterViewProps) {
                   )}
                 </Show>
               </box>
+
+              <Show when={loopLabel()}>
+                <box
+                  width="100%"
+                  height={1}
+                  flexShrink={0}
+                  paddingLeft={1}
+                  paddingRight={1}
+                  backgroundColor={theme().statusAccent}
+                >
+                  <text wrapMode="none" truncate>
+                    <span style={{ fg: theme().warning, bold: true }}>{loopLabel()}</span>
+                  </text>
+                </box>
+              </Show>
             </Show>
           </box>
         }

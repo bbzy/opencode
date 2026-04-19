@@ -24,7 +24,8 @@
 //   `data.questions`. The footer shows whichever is first. When a reply
 //   event arrives, the queue entry is removed and the footer falls back
 //   to the next pending request or to the prompt view.
-import type { Event, Part, PermissionRequest, QuestionRequest, ToolPart } from "@opencode-ai/sdk/v2"
+import type { Event, LoopState2, Part, PermissionRequest, QuestionRequest, ToolPart } from "@opencode-ai/sdk/v2"
+import { loopConfig } from "@/session/loop"
 import * as Locale from "@/util/locale"
 import { toolView } from "./tool"
 import type { FooterOutput, FooterPatch, FooterView, StreamCommit } from "./types"
@@ -188,6 +189,22 @@ function isAbort(error: { name?: string } | undefined): boolean {
 
 function msgErr(id: string): string {
   return `msg:${id}:error`
+}
+
+function formatLoopState(state: LoopState2): string {
+  const round = state.rounds > 0 ? `#${state.rounds}` : ""
+  const consecutiveDry = state.consecutiveDry ?? 0
+  const dry = consecutiveDry > 0 ? ` ${consecutiveDry}/${loopConfig.maxDryIterations} idle` : ""
+  const resetInterval = (state as { resetInterval?: number }).resetInterval ?? 0
+  const roundsSinceReset = (state as { roundsSinceReset?: number }).roundsSinceReset ?? 0
+  const reset = resetInterval > 0 ? ` ${roundsSinceReset}/${resetInterval} to reset` : ""
+  if (state.paused) {
+    const reason = consecutiveDry > 0 ? `paused, ${consecutiveDry}/${loopConfig.maxDryIterations} idle` : "paused"
+    return `CYCLE ${round}(${reason})${reset}`.trim()
+  }
+  if (state.running) return `CYCLE ${round}(running${dry})${reset}`.trim()
+  if (state.pending) return `CYCLE ${round}(queued${dry})${reset}`.trim()
+  return `CYCLE ${round}(${state.intervalStr})${dry}${reset}`.trim()
 }
 
 function patch(patch?: FooterPatch, view?: FooterView): FooterOutput | undefined {
@@ -921,6 +938,8 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
       return out(data, commits)
     }
 
+    let footer: FooterOutput | undefined
+
     if (part.type === "tool") {
       const view = syncPermission(data, part) ?? syncQuestion(data, part)
       if (part.tool === "bash" && part.callID) {
@@ -1016,7 +1035,7 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
     if (role === "user" && part.type === "text" && !data.includeUserText) {
       data.ids.add(part.id)
       drop(data, part.id)
-      return out(data, commits)
+      return out(data, commits, footer)
     }
 
     if (kind === "reasoning" && !input.thinking) {
@@ -1024,7 +1043,7 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
         data.ids.add(part.id)
       }
       drop(data, part.id)
-      return out(data, commits)
+      return out(data, commits, footer)
     }
 
     data.part.set(part.id, role === "user" && kind === "assistant" ? "user" : kind)
@@ -1035,22 +1054,22 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
     }
 
     if (msg && !role) {
-      return out(data, commits)
+      return out(data, commits, footer)
     }
 
     if (!ready(data, part.id)) {
-      return out(data, commits)
+      return out(data, commits, footer)
     }
 
     flushPart(data, commits, part.id)
 
     if (!part.time?.end) {
-      return out(data, commits)
+      return out(data, commits, footer)
     }
 
     data.ids.add(part.id)
     drop(data, part.id)
-    return out(data, commits)
+    return out(data, commits, footer)
   }
 
   if (event.type === "permission.asked") {
@@ -1107,6 +1126,14 @@ export function reduceSessionData(input: SessionDataInput): SessionDataOutput {
       source: "system",
     })
     return out(data, commits)
+  }
+
+  if (event.type === "session.loop.updated") {
+    if (event.properties.sessionID !== input.sessionID) {
+      return out(data, commits)
+    }
+    const state = event.properties.state
+    return out(data, commits, patch(state ? { loop: formatLoopState(state) } : { loop: null }))
   }
 
   return out(data, commits)

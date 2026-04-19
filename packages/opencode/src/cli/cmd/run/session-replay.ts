@@ -157,10 +157,47 @@ function replayMessage(
   config: ReplayConfig,
 ): ReplayMessage {
   if (message.info.role === "user") {
+    let patch: FooterPatch | undefined
+    const commit = apply(
+      data,
+      {
+        id: `bootstrap:message:${message.info.id}`,
+        type: "message.updated",
+        properties: {
+          sessionID: message.info.sessionID,
+          info: message.info,
+        },
+      },
+      message.info.sessionID,
+      thinking,
+      config.limits,
+    )
+    patch = mergePatch(patch, commit.footer?.patch)
+
+    for (const part of message.parts) {
+      const next = apply(
+        data,
+        {
+          id: `bootstrap:part:${part.id}`,
+          type: "message.part.updated",
+          properties: {
+            sessionID: part.sessionID,
+            part,
+            time: 0,
+          },
+        },
+        message.info.sessionID,
+        thinking,
+        config.limits,
+      )
+      patch = mergePatch(patch, next.footer?.patch)
+    }
+
     const prompt = messagePrompt(message)
     if (!prompt.text.trim()) {
       return {
         commits: [],
+        patch,
       }
     }
 
@@ -174,6 +211,7 @@ function replayMessage(
           messageID: message.info.id,
         },
       ],
+      patch,
     }
   }
 

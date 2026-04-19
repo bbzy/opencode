@@ -46,6 +46,7 @@ export function hints(template: string) {
 export const Default = {
   INIT: "init",
   REVIEW: "review",
+  CYCLE: "cycle",
 } as const
 
 export interface Interface {
@@ -85,6 +86,13 @@ const layer = Layer.effect(
         },
         subtask: true,
         hints: hints(PROMPT_REVIEW),
+      }
+      commands[Default.CYCLE] = {
+        name: Default.CYCLE,
+        description: "repeat a task on an idle-anchored interval (starts <interval> after each idle)",
+        source: "command",
+        template: "",
+        hints: [],
       }
 
       for (const [name, command] of Object.entries(cfg.command ?? {})) {

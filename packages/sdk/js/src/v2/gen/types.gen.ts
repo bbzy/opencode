@@ -81,6 +81,7 @@ export type Event =
   | EventProjectUpdated
   | EventSessionStatus
   | EventSessionIdle
+  | EventSessionLoopUpdated
   | EventQuestionAsked
   | EventQuestionReplied
   | EventQuestionRejected
@@ -691,6 +692,21 @@ export type SessionStatus =
   | {
       type: "busy"
     }
+
+export type LoopState = {
+  mode?: "loop" | "cycle"
+  intervalStr: string
+  rounds: number
+  startedAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  nextRunAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  paused: boolean
+  pending: boolean
+  running: boolean
+  consecutiveFailures: number
+  consecutiveDry?: number
+  coalescedCount: number
+  lastStatus?: "success" | "fail"
+}
 
 export type QuestionOption = {
   /**
@@ -1507,6 +1523,14 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "session.loop.updated"
+        properties: {
+          sessionID: string
+          state?: LoopState
+        }
+      }
+    | {
+        id: string
         type: "question.asked"
         properties: {
           id: string
@@ -2014,6 +2038,7 @@ export type Config = {
     max_lines?: number
     max_bytes?: number
   }
+  task_model?: boolean
   compaction?: {
     auto?: boolean
     prune?: boolean
@@ -2818,6 +2843,21 @@ export type SessionStatus2 = {
   }
 }
 
+export type LoopState1 = {
+  mode?: "loop" | "cycle"
+  intervalStr: string
+  rounds: number
+  startedAt: number | "NaN" | "Infinity" | "-Infinity"
+  nextRunAt: number | "NaN" | "Infinity" | "-Infinity"
+  paused: boolean
+  pending: boolean
+  running: boolean
+  consecutiveFailures: number
+  consecutiveDry?: number
+  coalescedCount: number
+  lastStatus?: "success" | "fail"
+}
+
 export type QuestionReplied2 = {
   id: string
   metadata?: {
@@ -2932,6 +2972,7 @@ export type V2Event =
   | ProjectUpdated
   | SessionStatus2
   | SessionIdle
+  | SessionLoopUpdated
   | QuestionAsked
   | QuestionReplied2
   | QuestionRejected2
@@ -3017,6 +3058,21 @@ export type EventTuiSessionSelect2 = {
      */
     sessionID: string
   }
+}
+
+export type LoopState2 = {
+  mode?: "loop" | "cycle"
+  intervalStr: string
+  rounds: number
+  startedAt: number | "NaN" | "Infinity" | "-Infinity"
+  nextRunAt: number | "NaN" | "Infinity" | "-Infinity"
+  paused: boolean
+  pending: boolean
+  running: boolean
+  consecutiveFailures: number
+  consecutiveDry?: number
+  coalescedCount: number
+  lastStatus?: "success" | "fail"
 }
 
 export type CredentialValue = CredentialOAuth | CredentialKey
@@ -5930,6 +5986,24 @@ export type SessionIdle = {
   }
 }
 
+export type SessionLoopUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.loop.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    sessionID: string
+    state?: LoopState1
+  }
+}
+
 export type QuestionAsked = {
   id: string
   metadata?: {
@@ -6945,6 +7019,15 @@ export type EventSessionIdle = {
   type: "session.idle"
   properties: {
     sessionID: string
+  }
+}
+
+export type EventSessionLoopUpdated = {
+  id: string
+  type: "session.loop.updated"
+  properties: {
+    sessionID: string
+    state?: LoopState2
   }
 }
 
