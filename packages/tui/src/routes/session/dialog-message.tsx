@@ -4,6 +4,8 @@ import { DialogSelect } from "../../ui/dialog-select"
 import { useSDK } from "../../context/sdk"
 import { useRoute } from "../../context/route"
 import { useClipboard } from "../../context/clipboard"
+import { useToast } from "../../ui/toast"
+import { errorMessage } from "../../util/error"
 import type { PromptInfo } from "../../component/prompt/history"
 import { stripPromptPartIDs as strip } from "../../prompt/part"
 
@@ -17,6 +19,7 @@ export function DialogMessage(props: {
   const message = createMemo(() => sync.data.message[props.sessionID]?.find((x) => x.id === props.messageID))
   const route = useRoute()
   const clipboard = useClipboard()
+  const toast = useToast()
 
   return (
     <DialogSelect
@@ -33,6 +36,8 @@ export function DialogMessage(props: {
             void sdk.client.session.revert({
               sessionID: props.sessionID,
               messageID: msg.id,
+            }).catch((error) => {
+              toast.show({ title: "Failed to revert message", message: errorMessage(error), variant: "error" })
             })
 
             if (props.setPrompt) {

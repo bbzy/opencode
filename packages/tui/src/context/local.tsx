@@ -1,6 +1,6 @@
 import { createStore } from "solid-js/store"
 import { createSimpleContext } from "./helper"
-import { batch, createEffect, createMemo } from "solid-js"
+import { batch, createEffect, createMemo, onCleanup } from "solid-js"
 import { useSync } from "./sync"
 import { useEvent } from "./event"
 import path from "path"
@@ -176,6 +176,8 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           recent: modelStore.recent,
           favorite: modelStore.favorite,
           variant: modelStore.variant,
+        }).catch((error) => {
+          console.error("Failed to persist model preferences", { error })
         })
       }
 
@@ -430,6 +432,8 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         state.pending = false
         void writeJsonAtomic(filePath, {
           pinned: sessionStore.pinned,
+        }).catch((error) => {
+          console.error("Failed to persist pinned sessions", { error })
         })
       }
 
@@ -466,9 +470,11 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         })
       }
 
-      event.on("session.deleted", (evt) => {
-        prune(evt.properties.info.id)
-      })
+      onCleanup(
+        event.on("session.deleted", (evt) => {
+          prune(evt.properties.info.id)
+        }),
+      )
 
       return {
         get ready() {
@@ -530,12 +536,19 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       })
     })
 
+    const loopState = createMemo(() => {
+      const current = route.data
+      if (current.type !== "session") return undefined
+      return sync.data.loop_state[current.sessionID]
+    })
+
     const result = {
       model,
       agent,
       mcp,
       session,
       permission,
+      loopState,
     }
     return result
   },

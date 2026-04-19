@@ -23,6 +23,8 @@ export function usePromptWorkspace(sessionID?: string) {
   const [creating, setCreating] = createSignal(false)
   const [creatingDots, setCreatingDots] = createSignal(3)
   const [notice, setNotice] = createSignal<string>()
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => clearTimeout(noticeTimer))
 
   async function create(selection: Extract<WorkspaceSelection, { type: "new" }>) {
     setCreating(true)
@@ -95,10 +97,12 @@ export function usePromptWorkspace(sessionID?: string) {
 
   function showNotice(name: string) {
     setNotice(`Warped to ${name}`)
-    setTimeout(() => setNotice(undefined), 4000)
+    clearTimeout(noticeTimer)
+    noticeTimer = setTimeout(() => setNotice(undefined), 4000)
   }
 
   function clearNotice() {
+    clearTimeout(noticeTimer)
     setNotice(undefined)
   }
 

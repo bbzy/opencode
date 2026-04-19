@@ -236,9 +236,13 @@ export function DialogSessionList() {
       const isDeleting = toDelete() === x.id
       const status = sync.data.session_status?.[x.id]
       const isWorking = status?.type === "busy" || status?.type === "retry"
+      const isWaiting =
+        (sync.data.question[x.id]?.length ?? 0) > 0 || (sync.data.permission[x.id]?.length ?? 0) > 0
       const slot = slotByID.get(x.id)
       const gutter = isWorking
-        ? () => <Spinner />
+        ? isWaiting
+          ? () => <text fg={theme.accent}>?</text>
+          : () => <Spinner />
         : slot !== undefined
           ? () => <text fg={theme.accent}>{slot}</text>
           : undefined

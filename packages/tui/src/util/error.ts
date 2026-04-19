@@ -67,8 +67,8 @@ export function cliErrorMessage(input: unknown): string | undefined {
     ].join("\n")
   }
 
-  if (tagged(input, "UICancelledError") || named(input, "UICancelledError")) return ""
-  if (isRecord(input) && named(input, "MCPFailed")) {
+  if (tagged(input, "UICancelledError") || errorNamed(input, "UICancelledError")) return ""
+  if (isRecord(input) && errorNamed(input, "MCPFailed")) {
     const name = isRecord(input.data) ? field(input.data, "name") : undefined
     return `MCP server "${name}" failed. Note, opencode does not support MCP authentication yet.`
   }
@@ -79,7 +79,7 @@ function tagged(input: unknown, tag: string): input is Record<string, unknown> {
   return isRecord(input) && input._tag === tag
 }
 
-function named(input: unknown, name: string) {
+export function errorNamed(input: unknown, name: string) {
   return isRecord(input) && (input.name === name || input._tag === name)
 }
 

@@ -5,18 +5,23 @@ import type { TextareaRenderable } from "@opentui/core"
 import { selectedForeground, tint, useTheme } from "../../context/theme"
 import type { QuestionAnswer, QuestionRequest } from "@opencode-ai/sdk/v2"
 import { useSDK } from "../../context/sdk"
+import { useSync } from "../../context/sync"
 import { SplitBorder } from "../../ui/border"
 import { useTuiConfig } from "../../config"
 import { useBindings, useOpencodeModeStack } from "../../keymap"
+import { useToast } from "../../ui/toast"
+import { errorMessage, errorNamed } from "../../util/error"
 
 const QUESTION_MODE = "question"
 
 export function QuestionPrompt(props: { request: QuestionRequest; directory?: string }) {
   const sdk = useSDK()
+  const sync = useSync()
   const { theme } = useTheme()
   const renderer = useRenderer()
   const tuiConfig = useTuiConfig()
   const modeStack = useOpencodeModeStack()
+  const toast = useToast()
 
   const questions = createMemo(() => props.request.questions)
   const single = createMemo(() => questions().length === 1 && questions()[0]?.multiple !== true)
@@ -47,18 +52,47 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
 
   function submit() {
     const answers = questions().map((_, i) => store.answers[i] ?? [])
-    void sdk.client.question.reply({
-      requestID: props.request.id,
-      directory: props.directory,
-      answers,
-    })
+    report(
+      "Failed to submit answer",
+      sdk.client.question.reply({
+        requestID: props.request.id,
+        directory: props.directory,
+        answers,
+      }),
+    )
   }
 
   function reject() {
-    void sdk.client.question.reject({
-      requestID: props.request.id,
-      directory: props.directory,
-    })
+    report(
+      "Failed to reject question",
+      sdk.client.question.reject({
+        requestID: props.request.id,
+        directory: props.directory,
+      }),
+    )
+  }
+
+  // A not-found reply means the server already dropped the request (turn
+  // interrupted, instance disposed) — the question is a phantom that no
+  // replied/rejected event will ever clear, so remove it locally.
+  function dismissStale(error: unknown): boolean {
+    if (!errorNamed(error, "QuestionNotFoundError") && !errorNamed(error, "SessionNotFoundError")) return false
+    sync.question.remove(props.request.sessionID, props.request.id)
+    return true
+  }
+
+  // The generated client resolves with { error } for HTTP errors and only
+  // rejects for transport failures, so both channels must be handled.
+  function report(title: string, promise: Promise<{ error?: unknown }>) {
+    void promise
+      .then((result) => {
+        if (!result.error) return
+        if (dismissStale(result.error)) return
+        toast.show({ title, message: errorMessage(result.error), variant: "error" })
+      })
+      .catch((error: unknown) => {
+        toast.show({ title, message: errorMessage(error), variant: "error" })
+      })
   }
 
   function pick(answer: string, custom: boolean = false) {
@@ -71,11 +105,14 @@ export function QuestionPrompt(props: { request: QuestionRequest; directory?: st
       setStore("custom", inputs)
     }
     if (single()) {
-      void sdk.client.question.reply({
-        requestID: props.request.id,
-        directory: props.directory,
-        answers: [[answer]],
-      })
+      report(
+        "Failed to submit answer",
+        sdk.client.question.reply({
+          requestID: props.request.id,
+          directory: props.directory,
+          answers: [[answer]],
+        }),
+      )
       return
     }
     setStore("tab", store.tab + 1)

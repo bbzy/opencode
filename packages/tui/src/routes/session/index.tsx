@@ -324,21 +324,23 @@ export function Session() {
   })
 
   let lastSwitch: string | undefined = undefined
-  event.on("message.part.updated", (evt) => {
-    const part = evt.properties.part
-    if (part.type !== "tool") return
-    if (part.sessionID !== route.sessionID) return
-    if (part.state.status !== "completed") return
-    if (part.id === lastSwitch) return
+  onCleanup(
+    event.on("message.part.updated", (evt) => {
+      const part = evt.properties.part
+      if (part.type !== "tool") return
+      if (part.sessionID !== route.sessionID) return
+      if (part.state.status !== "completed") return
+      if (part.id === lastSwitch) return
 
-    if (part.tool === "plan_exit") {
-      local.agent.set("build")
-      lastSwitch = part.id
-    } else if (part.tool === "plan_enter") {
-      local.agent.set("plan")
-      lastSwitch = part.id
-    }
-  })
+      if (part.tool === "plan_exit") {
+        local.agent.set("build")
+        lastSwitch = part.id
+      } else if (part.tool === "plan_enter") {
+        local.agent.set("plan")
+        lastSwitch = part.id
+      }
+    }),
+  )
 
   let seeded = false
   let scroll: ScrollBoxRenderable
@@ -354,25 +356,27 @@ export function Session() {
   const dialog = useDialog()
   const renderer = useRenderer()
 
-  event.on("session.status", (evt) => {
-    if (evt.properties.sessionID !== route.sessionID) return
-    if (evt.properties.status.type !== "retry") return
-    if (!evt.properties.status.action) return
-    if (dialog.stack.length > 0) return
+  onCleanup(
+    event.on("session.status", (evt) => {
+      if (evt.properties.sessionID !== route.sessionID) return
+      if (evt.properties.status.type !== "retry") return
+      if (!evt.properties.status.action) return
+      if (dialog.stack.length > 0) return
 
-    const keys = goUpsellKeys(evt.properties.status.action)
-    if (!keys) return
+      const keys = goUpsellKeys(evt.properties.status.action)
+      if (!keys) return
 
-    const seen = kv.get(keys.lastSeenAt)
-    if (typeof seen === "number" && Date.now() - seen < GO_UPSELL_WINDOW) return
+      const seen = kv.get(keys.lastSeenAt)
+      if (typeof seen === "number" && Date.now() - seen < GO_UPSELL_WINDOW) return
 
-    if (kv.get(keys.dontShow)) return
+      if (kv.get(keys.dontShow)) return
 
-    void DialogRetryAction.show(dialog, evt.properties.status.action).then((dontShowAgain) => {
-      if (dontShowAgain) kv.set(keys.dontShow, true)
-      kv.set(keys.lastSeenAt, Date.now())
-    })
-  })
+      void DialogRetryAction.show(dialog, evt.properties.status.action).then((dontShowAgain) => {
+        if (dontShowAgain) kv.set(keys.dontShow, true)
+        kv.set(keys.lastSeenAt, Date.now())
+      })
+    }),
+  )
 
   // Helper: Find next visible message boundary in direction
   const findNextVisibleMessage = (direction: "next" | "prev"): string | null => {
@@ -580,6 +584,8 @@ export function Session() {
           sessionID: route.sessionID,
           modelID: selectedModel.modelID,
           providerID: selectedModel.providerID,
+        }).catch((error) => {
+          toast.show({ title: "Failed to summarize session", message: errorMessage(error), variant: "error" })
         })
         dialog.clear()
       },
@@ -627,6 +633,9 @@ export function Session() {
           .then(() => {
             toBottom()
           })
+          .catch((error) => {
+            toast.show({ title: "Failed to undo", message: errorMessage(error), variant: "error" })
+          })
         const parts = sync.data.part[message.id]
         prompt?.set(
           parts.reduce(
@@ -659,6 +668,8 @@ export function Session() {
         if (!message) {
           void sdk.client.session.unrevert({
             sessionID: route.sessionID,
+          }).catch((error) => {
+            toast.show({ title: "Failed to redo", message: errorMessage(error), variant: "error" })
           })
           prompt?.set({ input: "", parts: [] })
           return
@@ -666,6 +677,8 @@ export function Session() {
         void sdk.client.session.revert({
           sessionID: route.sessionID,
           messageID: message.id,
+        }).catch((error) => {
+          toast.show({ title: "Failed to redo", message: errorMessage(error), variant: "error" })
         })
       },
     },
@@ -1028,6 +1041,8 @@ export function Session() {
         void sdk.client.experimental.session.background({
           sessionID: route.sessionID,
           workspace: project.workspace.current(),
+        }).catch((error) => {
+          toast.show({ title: "Failed to background subagents", message: errorMessage(error), variant: "error" })
         })
         dialog.clear()
       },
@@ -1368,7 +1383,6 @@ function UserMessage(props: {
   index: number
   pending?: number
 }) {
-  const ctx = use()
   const local = useLocal()
   const text = createMemo(() => {
     const texts = props.parts
@@ -1387,7 +1401,7 @@ function UserMessage(props: {
   const queued = createMemo(() => props.pending !== undefined && props.index > props.pending)
   const color = createMemo(() => local.agent.color(props.message.agent))
   const queuedFg = createMemo(() => selectedForeground(theme, color()))
-  const metadataVisible = createMemo(() => queued() || ctx.showTimestamps())
+  const metadataVisible = createMemo(() => queued())
 
   const compaction = createMemo(() => props.parts.find((x) => x.type === "compaction"))
 
@@ -1434,18 +1448,7 @@ function UserMessage(props: {
                 </For>
               </box>
             </Show>
-            <Show
-              when={queued()}
-              fallback={
-                <Show when={ctx.showTimestamps()}>
-                  <text fg={theme.textMuted}>
-                    <span style={{ fg: theme.textMuted }}>
-                      {Locale.todayTimeOrDateTime(props.message.time.created)}
-                    </span>
-                  </text>
-                </Show>
-              }
-            >
+            <Show when={queued()}>
               <text fg={theme.textMuted}>
                 <span style={{ bg: color(), fg: queuedFg(), bold: true }}> QUEUED </span>
               </text>
@@ -1486,6 +1489,11 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
     return props.message.time.completed - user.time.created
   })
 
+  const timestamp = createMemo(() => {
+    if (!ctx.showTimestamps()) return ""
+    return Locale.todayTimeOrDateTime(props.message.time.completed ?? props.message.time.created)
+  })
+
   const childShortcut = useCommandShortcut("session.child.first")
   const backgroundShortcut = useCommandShortcut("session.background")
 
@@ -1494,6 +1502,13 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
       <For each={props.parts}>
         {(part, index) => {
           const component = createMemo(() => PART_MAPPING[part.type as keyof typeof PART_MAPPING])
+          const prevTimestamp = createMemo(() => {
+            if (!ctx.showTimestamps()) return ""
+            const i = index()
+            if (i === 0) return ""
+            const input = partTimestampInput(props.parts[i - 1])
+            return input === undefined ? "" : Locale.todayTimeOrDateTime(input)
+          })
           return (
             <Show when={component()}>
               <Dynamic
@@ -1501,6 +1516,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
                 component={component()}
                 part={part as any}
                 message={props.message}
+                prevTimestamp={prevTimestamp}
               />
             </Show>
           )
@@ -1561,6 +1577,9 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
               </span>{" "}
               <span style={{ fg: theme.text }}>{Locale.titlecase(props.message.mode)}</span>
               <span style={{ fg: theme.textMuted }}> · {model()}</span>
+              <Show when={timestamp()}>
+                <span style={{ fg: theme.textMuted }}> · {timestamp()}</span>
+              </Show>
               <Show when={duration()}>
                 <span style={{ fg: theme.textMuted }}> · {Locale.duration(duration())}</span>
               </Show>
@@ -1581,9 +1600,18 @@ const PART_MAPPING = {
   reasoning: ReasoningPart,
 }
 
+function partTimestampInput(part: Part): number | undefined {
+  if (part.type === "text") return part.time?.start
+  if (part.type === "reasoning") return part.time.start
+  if (part.type === "tool") {
+    return part.state.status === "pending" ? undefined : part.state.time.start
+  }
+  return undefined
+}
+
 const INLINE_TOOL_ICON_WIDTH = 2
 
-function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: AssistantMessage }) {
+function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: AssistantMessage; prevTimestamp: () => string }) {
   const { theme } = useTheme()
   const ctx = use()
   // Collapsed by default in hide mode: a single line throughout, so the
@@ -1605,6 +1633,11 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
   })
   const summary = createMemo(() => reasoningSummary(content()))
   const syntax = createSyntaxStyleMemo(() => generateSubtleSyntax(theme))
+  const timestamp = createMemo(() => {
+    if (!ctx.showTimestamps()) return ""
+    const formatted = Locale.todayTimeOrDateTime(props.part.time.start)
+    return formatted === props.prevTimestamp() ? "" : formatted
+  })
 
   const toggle = () => {
     if (!inMinimal() || opaque()) return
@@ -1642,6 +1675,9 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
               fg={theme.textMuted}
             />
           </box>
+        </Show>
+        <Show when={timestamp()}>
+          <text fg={theme.textMuted}>{timestamp()}</text>
         </Show>
       </box>
     </Show>
@@ -1683,9 +1719,14 @@ function ReasoningHeader(props: {
   )
 }
 
-function TextPart(props: { last: boolean; part: TextPart; message: AssistantMessage }) {
+function TextPart(props: { last: boolean; part: TextPart; message: AssistantMessage; prevTimestamp: () => string }) {
   const ctx = use()
   const { theme, syntax } = useTheme()
+  const timestamp = createMemo(() => {
+    if (!ctx.showTimestamps() || !props.part.time?.start) return ""
+    const formatted = Locale.todayTimeOrDateTime(props.part.time.start)
+    return formatted === props.prevTimestamp() ? "" : formatted
+  })
   return (
     <Show when={props.part.text.trim()}>
       <box ref={(el: BoxRenderable) => alwaysSeparate.add(el)} paddingLeft={3} marginTop={1} flexShrink={0}>
@@ -1699,6 +1740,9 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
           fg={theme.markdownText}
           bg={theme.background}
         />
+        <Show when={timestamp()}>
+          <text fg={theme.textMuted}>{timestamp()}</text>
+        </Show>
       </box>
     </Show>
   )
@@ -1706,8 +1750,9 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
 
 // Pending messages moved to individual tool pending functions
 
-function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage }) {
+function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage; prevTimestamp: () => string }) {
   const ctx = use()
+  const { theme } = useTheme()
   const display = createMemo(() => toolDisplay(props.part.tool))
 
   // Hide tool if showDetails is false and tool completed successfully
@@ -1715,6 +1760,14 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
     if (ctx.showDetails()) return false
     if (props.part.state.status !== "completed") return false
     return true
+  })
+
+  const timestamp = createMemo(() => {
+    if (!ctx.showTimestamps()) return ""
+    const state = props.part.state
+    if (state.status === "pending") return ""
+    const formatted = Locale.todayTimeOrDateTime(state.time.start)
+    return formatted === props.prevTimestamp() ? "" : formatted
   })
 
   const toolprops = {
@@ -1784,6 +1837,11 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
           <GenericTool {...toolprops} />
         </Match>
       </Switch>
+      <Show when={timestamp()}>
+        <box paddingLeft={3}>
+          <text fg={theme.textMuted}>{timestamp()}</text>
+        </box>
+      </Show>
     </Show>
   )
 }

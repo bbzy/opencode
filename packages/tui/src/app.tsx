@@ -24,6 +24,7 @@ import {
   Show,
   on,
 } from "solid-js"
+
 import { TuiPathsProvider, TuiStartupProvider, TuiTerminalEnvironmentProvider, useTuiStartup } from "./context/runtime"
 import { DialogProvider, useDialog } from "./ui/dialog"
 import { DialogProvider as DialogProviderList } from "./component/dialog-provider"
@@ -514,6 +515,8 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
           } else {
             toast.show({ message: "Failed to fork session", variant: "error" })
           }
+        }).catch((error) => {
+          toast.show({ message: `Failed to fork session: ${errorMessage(error)}`, variant: "error" })
         })
       } else {
         route.navigate({ type: "session", sessionID: match })
@@ -534,6 +537,8 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
       } else {
         toast.show({ message: "Failed to fork session", variant: "error" })
       }
+    }).catch((error) => {
+      toast.show({ message: `Failed to fork session: ${errorMessage(error)}`, variant: "error" })
     })
   })
 
@@ -982,54 +987,64 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     bindings: tuiConfig.keybinds.gather("app_exit", ["app.exit"]),
   }))
 
-  event.on("tui.command.execute", (evt, { workspace }) => {
-    if (workspace !== project.workspace.current()) return
-    keymap.dispatchCommand(evt.properties.command)
-  })
+  onCleanup(
+    event.on("tui.command.execute", (evt, { workspace }) => {
+      if (workspace !== project.workspace.current()) return
+      keymap.dispatchCommand(evt.properties.command)
+    }),
+  )
 
-  event.on("tui.toast.show", (evt, { workspace }) => {
-    if (workspace !== project.workspace.current()) return
-    toast.show({
-      title: evt.properties.title,
-      message: evt.properties.message,
-      variant: evt.properties.variant,
-      duration: evt.properties.duration,
-    })
-  })
-
-  event.on("tui.session.select", (evt, { workspace }) => {
-    if (workspace !== project.workspace.current()) return
-    route.navigate({
-      type: "session",
-      sessionID: evt.properties.sessionID,
-    })
-  })
-
-  event.on("session.deleted", (evt) => {
-    if (route.data.type === "session" && route.data.sessionID === evt.properties.info.id) {
-      route.navigate({ type: "home" })
+  onCleanup(
+    event.on("tui.toast.show", (evt, { workspace }) => {
+      if (workspace !== project.workspace.current()) return
       toast.show({
-        variant: "info",
-        message: "The current session was deleted",
+        title: evt.properties.title,
+        message: evt.properties.message,
+        variant: evt.properties.variant,
+        duration: evt.properties.duration,
       })
-    }
-  })
+    }),
+  )
 
-  event.on("session.error", (evt, { workspace }) => {
-    if (workspace !== project.workspace.current()) return
-    const error = evt.properties.error
-    if (error && typeof error === "object" && error.name === "MessageAbortedError") return
-    const message = errorMessage(error)
+  onCleanup(
+    event.on("tui.session.select", (evt, { workspace }) => {
+      if (workspace !== project.workspace.current()) return
+      route.navigate({
+        type: "session",
+        sessionID: evt.properties.sessionID,
+      })
+    }),
+  )
 
-    toast.show({
-      variant: "error",
-      message,
-      duration: 5000,
-    })
-  })
+  onCleanup(
+    event.on("session.deleted", (evt) => {
+      if (route.data.type === "session" && route.data.sessionID === evt.properties.info.id) {
+        route.navigate({ type: "home" })
+        toast.show({
+          variant: "info",
+          message: "The current session was deleted",
+        })
+      }
+    }),
+  )
 
-  event.on("installation.update-available", async (evt) => {
-    console.log("installation.update-available", evt)
+  onCleanup(
+    event.on("session.error", (evt, { workspace }) => {
+      if (workspace !== project.workspace.current()) return
+      const error = evt.properties.error
+      if (error && typeof error === "object" && error.name === "MessageAbortedError") return
+      const message = errorMessage(error)
+
+      toast.show({
+        variant: "error",
+        message,
+        duration: 5000,
+      })
+    }),
+  )
+
+  onCleanup(
+    event.on("installation.update-available", async (evt) => {
     const version = evt.properties.version
 
     const skipped = kv.get("skipped_version")
@@ -1074,7 +1089,8 @@ function App(props: { onSnapshot?: () => Promise<string[]>; pluginHost: TuiPlugi
     )
 
     void exit()
-  })
+  }),
+  )
 
   const plugin = createMemo(() => {
     if (!ready()) return

@@ -127,7 +127,9 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
           void Promise.all([
             result.location.model.refresh(event.location),
             result.location.provider.refresh(event.location),
-          ])
+          ]).catch((error) => {
+            console.error("Failed to refresh catalog", { error })
+          })
           break
         case "session.next.agent.switched":
           message.update(event.data.sessionID, (draft) => {
@@ -390,14 +392,18 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
           })
           break
         case "reference.updated":
-          void result.location.reference.refresh()
+          void result.location.reference.refresh().catch((error) => {
+            console.error("Failed to refresh references", { error })
+          })
           break
         case "integration.updated":
           void Promise.all([
             result.location.integration.refresh(event.location),
             result.location.model.refresh(event.location),
             result.location.provider.refresh(event.location),
-          ])
+          ]).catch((error) => {
+            console.error("Failed to refresh integration", { error })
+          })
           break
       }
     }
