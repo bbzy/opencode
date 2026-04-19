@@ -16,12 +16,40 @@ import { InstanceBootstrap } from "../../src/project/bootstrap-service"
 import type { InstanceContext } from "../../src/project/instance-context"
 import { InstanceRuntime } from "../../src/project/instance-runtime"
 import { InstanceStore } from "../../src/project/instance-store"
+import { ProjectV2 } from "@opencode-ai/core/project"
 import { TestLLMServer } from "../lib/llm-server"
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
 export const testInstanceStoreLayer = LayerNode.compile(InstanceStore.node, [
   [InstanceStore.bootstrapNode, noopBootstrap],
 ])
+
+// SessionPrompt.node depends on InstanceStore for loop recovery. The real
+// store drags the project/bootstrap graph into the test runtime and wedges
+// scope teardown, so graphs compiling SessionPrompt.node substitute this
+// minimal store, which fabricates the instance context for the requested
+// directory without booting anything.
+const stubInstanceContext = (input: { directory: string }): InstanceContext => ({
+  directory: input.directory,
+  worktree: input.directory,
+  project: {
+    id: ProjectV2.ID.global,
+    worktree: input.directory,
+    time: { created: 0, updated: 0 },
+    sandboxes: [],
+  },
+})
+export const instanceStoreStub = Layer.succeed(
+  InstanceStore.Service,
+  InstanceStore.Service.of({
+    load: (input) => Effect.sync(() => stubInstanceContext(input)),
+    reload: (input) => Effect.sync(() => stubInstanceContext(input)),
+    dispose: () => Effect.void,
+    disposeDirectory: () => Effect.void,
+    disposeAll: () => Effect.void,
+    provide: (input, effect) => effect.pipe(Effect.provideService(InstanceRef, stubInstanceContext(input))),
+  }),
+)
 
 export async function provideTestInstance<R>(input: {
   directory: string
