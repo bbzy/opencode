@@ -19,6 +19,7 @@ import type {
   VcsInfo,
   SnapshotFileDiff,
   ConsoleState,
+  LoopState2,
 } from "@opencode-ai/sdk/v2"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useProject } from "./project"
@@ -90,6 +91,9 @@ export const {
       session_status: {
         [sessionID: string]: SessionStatus
       }
+      loop_state: {
+        [sessionID: string]: LoopState2 | undefined
+      }
       session_diff: {
         [sessionID: string]: SnapshotFileDiff[]
       }
@@ -132,6 +136,7 @@ export const {
       provider_default: {},
       session: [],
       session_status: {},
+      loop_state: {},
       session_diff: {},
       todo: {},
       message: {},
@@ -173,23 +178,41 @@ export const {
         .then((x) => (x.data ?? []).toSorted((a, b) => a.id.localeCompare(b.id)))
     }
 
+    function removeQuestion(sessionID: string, requestID: string) {
+      const requests = store.question[sessionID]
+      if (!requests) return
+      const match = search(requests, requestID, (r) => r.id)
+      if (!match.found) return
+      setStore(
+        "question",
+        sessionID,
+        produce((draft) => {
+          draft.splice(match.index, 1)
+        }),
+      )
+    }
+
+    function removePermission(sessionID: string, requestID: string) {
+      const requests = store.permission[sessionID]
+      if (!requests) return
+      const match = search(requests, requestID, (r) => r.id)
+      if (!match.found) return
+      setStore(
+        "permission",
+        sessionID,
+        produce((draft) => {
+          draft.splice(match.index, 1)
+        }),
+      )
+    }
+
     event.subscribe((event, { directory, workspace }) => {
       switch (event.type) {
         case "server.instance.disposed":
           void bootstrap()
           break
         case "permission.replied": {
-          const requests = store.permission[event.properties.sessionID]
-          if (!requests) break
-          const match = search(requests, event.properties.requestID, (r) => r.id)
-          if (!match.found) break
-          setStore(
-            "permission",
-            event.properties.sessionID,
-            produce((draft) => {
-              draft.splice(match.index, 1)
-            }),
-          )
+          removePermission(event.properties.sessionID, event.properties.requestID)
           break
         }
 
@@ -201,6 +224,8 @@ export const {
               reply: "once",
               directory,
               workspace,
+            }).catch((error) => {
+              console.error("Failed to auto-approve permission", { error })
             })
             break
           }
@@ -226,17 +251,7 @@ export const {
 
         case "question.replied":
         case "question.rejected": {
-          const requests = store.question[event.properties.sessionID]
-          if (!requests) break
-          const match = search(requests, event.properties.requestID, (r) => r.id)
-          if (!match.found) break
-          setStore(
-            "question",
-            event.properties.sessionID,
-            produce((draft) => {
-              draft.splice(match.index, 1)
-            }),
-          )
+          removeQuestion(event.properties.sessionID, event.properties.requestID)
           break
         }
 
@@ -315,6 +330,17 @@ export const {
 
         case "session.status": {
           setStore("session_status", event.properties.sessionID, event.properties.status)
+          break
+        }
+
+        case "session.loop.updated": {
+          if (event.properties.state) {
+            setStore("loop_state", event.properties.sessionID, event.properties.state)
+          } else {
+            setStore("loop_state", produce((draft) => {
+              delete draft[event.properties.sessionID]
+            }))
+          }
           break
         }
 
@@ -432,7 +458,9 @@ export const {
 
         case "lsp.updated": {
           const workspace = project.workspace.current()
-          void sdk.client.lsp.status({ workspace }).then((x) => setStore("lsp", x.data ?? []))
+          void sdk.client.lsp.status({ workspace }).then((x) => setStore("lsp", x.data ?? [])).catch((error) => {
+            console.error("Failed to refresh LSP status", { error })
+          })
           break
         }
 
@@ -535,6 +563,9 @@ export const {
             project.workspace.sync(),
           ]).then(() => {
             setStore("status", "complete")
+          }).catch((error) => {
+            console.error("tui bootstrap non-blocking phase failed", { error })
+            setStore("status", "complete")
           })
         })
         .catch(async (e) => {
@@ -567,6 +598,12 @@ export const {
       },
       get path() {
         return project.instance.path()
+      },
+      question: {
+        remove: removeQuestion,
+      },
+      permission: {
+        remove: removePermission,
       },
       session: {
         get(sessionID: string) {

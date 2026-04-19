@@ -16,6 +16,8 @@ import { getScrollAcceleration } from "../../util/scroll"
 import { useTuiConfig } from "../../config"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut } from "../../keymap"
 import { usePathFormatter } from "../../context/path-format"
+import { useToast } from "../../ui/toast"
+import { errorMessage, errorNamed } from "../../util/error"
 
 type PermissionStage = "permission" | "always" | "reject"
 
@@ -112,12 +114,36 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
   const sdk = useSDK()
   const project = useProject()
   const sync = useSync()
+  const toast = useToast()
   const [store, setStore] = createStore({
     stage: "permission" as PermissionStage,
   })
   const pathFormatter = usePathFormatter()
 
   const session = createMemo(() => sync.data.session.find((s) => s.id === props.request.sessionID))
+
+  // A not-found reply means the server already dropped the request (turn
+  // interrupted, instance disposed) — the request is a phantom that no
+  // permission.replied event will ever clear, so remove it locally.
+  function dismissStale(error: unknown): boolean {
+    if (!errorNamed(error, "PermissionNotFoundError") && !errorNamed(error, "SessionNotFoundError")) return false
+    sync.permission.remove(props.request.sessionID, props.request.id)
+    return true
+  }
+
+  // The generated client resolves with { error } for HTTP errors and only
+  // rejects for transport failures, so both channels must be handled.
+  function report(title: string, promise: Promise<{ error?: unknown }>) {
+    void promise
+      .then((result) => {
+        if (!result.error) return
+        if (dismissStale(result.error)) return
+        toast.show({ title, message: errorMessage(result.error), variant: "error" })
+      })
+      .catch((error: unknown) => {
+        toast.show({ title, message: errorMessage(error), variant: "error" })
+      })
+  }
 
   const input = createMemo(() => {
     const tool = props.request.tool
@@ -165,25 +191,31 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
           onSelect={(option) => {
             setStore("stage", "permission")
             if (option === "cancel") return
-            void sdk.client.permission.reply({
-              reply: "always",
-              requestID: props.request.id,
-              directory: props.directory,
-              workspace: project.workspace.current(),
-            })
+            report(
+              "Failed to grant permission",
+              sdk.client.permission.reply({
+                reply: "always",
+                requestID: props.request.id,
+                directory: props.directory,
+                workspace: project.workspace.current(),
+              }),
+            )
           }}
         />
       </Match>
       <Match when={store.stage === "reject"}>
         <RejectPrompt
           onConfirm={(message) => {
-            void sdk.client.permission.reply({
-              reply: "reject",
-              requestID: props.request.id,
-              directory: props.directory,
-              message: message || undefined,
-              workspace: project.workspace.current(),
-            })
+            report(
+              "Failed to reject permission",
+              sdk.client.permission.reply({
+                reply: "reject",
+                requestID: props.request.id,
+                directory: props.directory,
+                message: message || undefined,
+                workspace: project.workspace.current(),
+              }),
+            )
           }}
           onCancel={() => {
             setStore("stage", "permission")
@@ -415,20 +447,26 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
                     setStore("stage", "reject")
                     return
                   }
-                  void sdk.client.permission.reply({
-                    reply: "reject",
+                  report(
+                    "Failed to reject permission",
+                    sdk.client.permission.reply({
+                      reply: "reject",
+                      requestID: props.request.id,
+                      directory: props.directory,
+                      workspace: project.workspace.current(),
+                    }),
+                  )
+                  return
+                }
+                report(
+                  "Failed to grant permission",
+                  sdk.client.permission.reply({
+                    reply: "once",
                     requestID: props.request.id,
                     directory: props.directory,
                     workspace: project.workspace.current(),
-                  })
-                  return
-                }
-                void sdk.client.permission.reply({
-                  reply: "once",
-                  requestID: props.request.id,
-                  directory: props.directory,
-                  workspace: project.workspace.current(),
-                })
+                  }),
+                )
               }}
             />
           )

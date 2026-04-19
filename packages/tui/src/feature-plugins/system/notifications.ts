@@ -32,57 +32,57 @@ const tui: TuiPlugin = async (api) => {
   const questions = new Set<string>()
   const permissions = new Set<string>()
 
-  api.event.on("question.asked", (event) => {
-    if (questions.has(event.properties.id)) return
-    questions.add(event.properties.id)
-    notify(api, event.properties.sessionID, "Question needs input", "question")
-  })
+  const offs = [
+    api.event.on("question.asked", (event) => {
+      if (questions.has(event.properties.id)) return
+      questions.add(event.properties.id)
+      notify(api, event.properties.sessionID, "Question needs input", "question")
+    }),
+    api.event.on("question.replied", (event) => {
+      questions.delete(event.properties.requestID)
+    }),
+    api.event.on("question.rejected", (event) => {
+      questions.delete(event.properties.requestID)
+    }),
+    api.event.on("permission.asked", (event) => {
+      if (permissions.has(event.properties.id)) return
+      permissions.add(event.properties.id)
+      notify(api, event.properties.sessionID, "Permission needs input", "permission")
+    }),
+    api.event.on("permission.replied", (event) => {
+      permissions.delete(event.properties.requestID)
+    }),
+    api.event.on("session.status", (event) => {
+      const sessionID = event.properties.sessionID
+      if (event.properties.status.type === "busy" || event.properties.status.type === "retry") {
+        active.add(sessionID)
+        errored.delete(sessionID)
+        return
+      }
 
-  api.event.on("question.replied", (event) => {
-    questions.delete(event.properties.requestID)
-  })
+      if (event.properties.status.type !== "idle") return
+      if (!active.has(sessionID)) return
+      active.delete(sessionID)
 
-  api.event.on("question.rejected", (event) => {
-    questions.delete(event.properties.requestID)
-  })
+      if (errored.has(sessionID)) {
+        errored.delete(sessionID)
+        return
+      }
 
-  api.event.on("permission.asked", (event) => {
-    if (permissions.has(event.properties.id)) return
-    permissions.add(event.properties.id)
-    notify(api, event.properties.sessionID, "Permission needs input", "permission")
-  })
+      const session = api.state.session.get(sessionID)
+      notify(api, sessionID, "Session done", session?.parentID ? "subagent_done" : "done")
+    }),
+    api.event.on("session.error", (event) => {
+      const sessionID = event.properties.sessionID
+      if (!sessionID) return
+      if (!active.has(sessionID)) return
+      errored.add(sessionID)
+      notify(api, sessionID, sessionErrorMessage(event.properties.error), "error")
+    }),
+  ]
 
-  api.event.on("permission.replied", (event) => {
-    permissions.delete(event.properties.requestID)
-  })
-
-  api.event.on("session.status", (event) => {
-    const sessionID = event.properties.sessionID
-    if (event.properties.status.type === "busy" || event.properties.status.type === "retry") {
-      active.add(sessionID)
-      errored.delete(sessionID)
-      return
-    }
-
-    if (event.properties.status.type !== "idle") return
-    if (!active.has(sessionID)) return
-    active.delete(sessionID)
-
-    if (errored.has(sessionID)) {
-      errored.delete(sessionID)
-      return
-    }
-
-    const session = api.state.session.get(sessionID)
-    notify(api, sessionID, "Session done", session?.parentID ? "subagent_done" : "done")
-  })
-
-  api.event.on("session.error", (event) => {
-    const sessionID = event.properties.sessionID
-    if (!sessionID) return
-    if (!active.has(sessionID)) return
-    errored.add(sessionID)
-    notify(api, sessionID, sessionErrorMessage(event.properties.error), "error")
+  api.lifecycle.onDispose(() => {
+    for (const off of offs) off()
   })
 }
 
