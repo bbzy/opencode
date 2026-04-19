@@ -23,7 +23,6 @@ import { LSP } from "@/lsp/lsp"
 import { ulid } from "ulid"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
-import * as Stream from "effect/Stream"
 import { Command } from "../command"
 import { pathToFileURL, fileURLToPath } from "url"
 import { Config } from "@/config/config"
@@ -42,8 +41,27 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import {
+  Cause,
+  Clock,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Latch,
+  Layer,
+  Option,
+  Queue,
+  Ref,
+  Scope,
+  Context,
+  Schema,
+  Stream,
+  Types,
+} from "effect"
 import { InstanceState } from "@/effect/instance-state"
+import { InstanceRef } from "@/effect/instance-ref"
+import { InstanceStore } from "@/project/instance-store"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -55,7 +73,11 @@ import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
+import { Loop } from "./loop"
+import { LoopEvent } from "@opencode-ai/schema/loop-event"
+import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { LLMEvent } from "@opencode-ai/llm"
+import { Storage } from "@/storage/storage"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -71,6 +93,8 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "image/webp",
 ])
 
+const FILE_MODIFY_TOOLS = new Set(["edit", "write", "apply_patch"])
+
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
 
 IMPORTANT:
@@ -80,6 +104,15 @@ IMPORTANT:
 - This tool provides your final answer - no further actions are taken after calling it`
 
 const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
+
+export const COMPLETION_MARKER = "<response>complete</response>"
+export const COMPLETION_MARKER_INSTRUCTION = `At the end of every response, you MUST append the exact string "${COMPLETION_MARKER}" to indicate the response is complete. Do not include this marker anywhere else in your response.`
+export const COMPLETION_MARKER_MISSING_WARNING =
+  'Auto-detection warning: the response does not end with "<response>complete</response>". The response may be incomplete — it may have been interrupted or truncated. Please confirm whether the response was cut off and continue if needed.'
+export const COMPLETION_INTERRUPTED_WARNING =
+  "Auto-detection warning: the response was interrupted (finish reason: unknown). The response may be incomplete. Please continue from where you left off."
+export const REASONING_STOP_WARNING =
+  "Auto-detection warning: the response was stopped while still in reasoning, without producing visible output or tool calls. The response may be incomplete. Please continue from where you left off."
 
 function mcpResourceBase64Size(value: string) {
   const trimmed = value.replace(/\s/g, "")
@@ -102,10 +135,12 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly loopRun: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.BusyError>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
+  readonly loopState: () => Effect.Effect<Record<string, LoopEvent.LoopState>>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
@@ -140,6 +175,8 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const storage = yield* Storage.Service
+    const instanceStore = yield* InstanceStore.Service
     const { db } = database
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
@@ -1067,6 +1104,19 @@ const layer = Layer.effect(
       }
 
       if (input.noReply === true) return message
+      const activeLoop = activeCycles.get(input.sessionID)
+      if (activeLoop) {
+        while (true) {
+          const result = yield* state
+            .tryRun(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+            .pipe(
+              Effect.map((value) => ({ _tag: "done" as const, value })),
+              Effect.catchTag("SessionBusyError", () => Effect.succeed({ _tag: "busy" as const })),
+            )
+          if (result._tag === "done") return result.value
+          yield* Effect.sleep(Duration.millis(100))
+        }
+      }
       return yield* loop({ sessionID: input.sessionID })
     })
 
@@ -1080,263 +1130,394 @@ const layer = Layer.effect(
 
     const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID) {
-        const ctx = yield* InstanceState.context
-        let structured: unknown
-        let step = 0
-        const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        return yield* Effect.gen(function* () {
+          const ctx = yield* InstanceState.context
+          let structured: unknown
+          let step = 0
+          let reasoningStopRetries = 0
+          const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
-        while (true) {
-          yield* status.set(sessionID, { type: "busy" })
-          yield* Effect.logInfo("loop", { "session.id": sessionID, step })
+          while (true) {
+            yield* status.set(sessionID, { type: "busy" })
+            yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
-
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
-
-          if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
-
-          const lastAssistantMsg = msgs.findLast(
-            (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
-          )
-          // Some providers return "stop" even when the assistant message contains
-          // tool calls. Keep the loop running so tool results can be sent back to
-          // the model, but ignore cleanup-marked interrupted orphans.
-          const hasToolCalls =
-            lastAssistantMsg?.parts.some(
-              (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
-            ) ?? false
-
-          if (
-            lastAssistant?.finish &&
-            !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-            !hasToolCalls &&
-            lastAssistant.parentID === lastUser.id
-          ) {
-            const orphan = lastAssistantMsg?.parts.find(
-              (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
-            )
-            if (orphan) {
-              yield* Effect.logWarning("loop exit with orphaned interrupted tool", {
-                "session.id": sessionID,
-                messageID: lastAssistant.id,
-                tool: orphan.tool,
-                callID: orphan.callID,
-              })
-            }
-            yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
-            break
-          }
-
-          step++
-          if (step === 1)
-            yield* title({
-              session,
-              modelID: lastUser.model.modelID,
-              providerID: lastUser.model.providerID,
-              history: msgs,
-            }).pipe(Effect.ignore, Effect.forkIn(scope))
-
-          const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
-          const task = tasks.pop()
-
-          if (task?.type === "subtask") {
-            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
-            continue
-          }
-
-          if (task?.type === "compaction") {
-            const result = yield* compaction.process({
-              messages: msgs,
-              parentID: lastUser.id,
-              sessionID,
-              auto: task.auto,
-              overflow: task.overflow,
-            })
-            if (result === "stop") break
-            continue
-          }
-
-          if (
-            lastFinished &&
-            lastFinished.summary !== true &&
-            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
-          ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-            continue
-          }
-
-          const agent = yield* agents.get(lastUser.agent)
-          if (!agent) {
-            const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-            const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-            const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
-            yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
-            throw error
-          }
-          const maxSteps = agent.steps ?? Infinity
-          const isLastStep = step >= maxSteps
-          msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
-            Effect.provideService(RuntimeFlags.Service, flags),
-            Effect.provideService(FSUtil.Service, fsys),
-            Effect.provideService(Session.Service, sessions),
-          )
-
-          const msg: SessionV1.Assistant = {
-            id: MessageID.ascending(),
-            parentID: lastUser.id,
-            role: "assistant",
-            mode: agent.name,
-            agent: agent.name,
-            variant: lastUser.model.variant,
-            path: { cwd: ctx.directory, root: ctx.worktree },
-            cost: 0,
-            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-            modelID: model.id,
-            providerID: model.providerID,
-            time: { created: Date.now() },
-            sessionID,
-          }
-          yield* sessions.updateMessage(msg)
-
-          const finalizeInterruptedAssistant = Effect.gen(function* () {
-            if (msg.time.completed) return
-            msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
-              providerID: msg.providerID,
-              aborted: true,
-            })
-            msg.time.completed = Date.now()
-            yield* sessions.updateMessage(msg)
-          })
-
-          const handle = yield* processor
-            .create({
-              assistantMessage: msg,
-              sessionID,
-              model,
-            })
-            .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
-
-          const outcome: "break" | "continue" = yield* Effect.gen(function* () {
-            const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
-            const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
-            const promptOps = yield* ops()
-
-            const tools = yield* SessionTools.resolve({
-              agent,
-              session,
-              model,
-              processor: handle,
-              bypassAgentCheck,
-              messages: msgs,
-              promptOps,
-            }).pipe(
-              Effect.provideService(Plugin.Service, plugin),
-              Effect.provideService(Permission.Service, permission),
-              Effect.provideService(ToolRegistry.Service, registry),
-              Effect.provideService(MCP.Service, mcp),
-              Effect.provideService(Truncate.Service, truncate),
-              Effect.provideService(RuntimeFlags.Service, flags),
+            let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+              Effect.provideService(Database.Service, database),
             )
 
-            if (lastUser.format?.type === "json_schema") {
-              tools["StructuredOutput"] = createStructuredOutputTool({
-                schema: lastUser.format.schema,
-                onSuccess(output) {
-                  structured = output
-                },
-              })
+            const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+
+            if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+            const lastAssistantMsg = msgs.findLast(
+              (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
+            )
+            // Some providers return "stop" even when the assistant message contains
+            // tool calls. Keep the loop running so tool results can be sent back to
+            // the model, but ignore cleanup-marked interrupted orphans.
+            const hasToolCalls =
+              lastAssistantMsg?.parts.some(
+                (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
+              ) ?? false
+
+            if (
+              lastAssistant?.finish &&
+              !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
+              !hasToolCalls &&
+              lastAssistant.parentID === lastUser.id
+            ) {
+              const orphan = lastAssistantMsg?.parts.find(
+                (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
+              )
+              if (orphan) {
+                yield* Effect.logWarning("loop exit with orphaned interrupted tool", {
+                  "session.id": sessionID,
+                  messageID: lastAssistant.id,
+                  tool: orphan.tool,
+                  callID: orphan.callID,
+                })
+              }
+              yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
+              break
             }
 
+            step++
             if (step === 1)
-              yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
+              yield* title({
+                session,
+                modelID: lastUser.model.modelID,
+                providerID: lastUser.model.providerID,
+                history: msgs,
+              }).pipe(Effect.ignore, Effect.forkIn(scope))
 
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+            const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+            const task = tasks.pop()
 
-            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
-              sys.skills(agent),
-              sys.environment(model),
-              instruction.system().pipe(Effect.orDie),
-              sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model),
-            ])
-            const system = [
-              ...env,
-              ...instructions,
-              ...(mcpInstructions ? [mcpInstructions] : []),
-              ...(skills ? [skills] : []),
-            ]
-            const format = lastUser.format ?? { type: "text" as const }
-            if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-            const result = yield* handle.process({
-              user: lastUser,
-              agent,
-              permission: session.permission,
+            if (task?.type === "subtask") {
+              yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
+              continue
+            }
+
+            if (task?.type === "compaction") {
+              const result = yield* compaction.process({
+                messages: msgs,
+                parentID: lastUser.id,
+                sessionID,
+                auto: task.auto,
+                overflow: task.overflow,
+              })
+              if (result === "stop") break
+              continue
+            }
+
+            if (
+              lastFinished &&
+              lastFinished.summary !== true &&
+              (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
+            ) {
+              yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+              continue
+            }
+
+            const agent = yield* agents.get(lastUser.agent)
+            if (!agent) {
+              const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+              const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+              const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
+              yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
+              throw error
+            }
+            const maxSteps = agent.steps ?? Infinity
+            const isLastStep = step >= maxSteps
+            msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
+              Effect.provideService(RuntimeFlags.Service, flags),
+              Effect.provideService(FSUtil.Service, fsys),
+              Effect.provideService(Session.Service, sessions),
+            )
+
+            const msg: SessionV1.Assistant = {
+              id: MessageID.ascending(),
+              parentID: lastUser.id,
+              role: "assistant",
+              mode: agent.name,
+              agent: agent.name,
+              variant: lastUser.model.variant,
+              path: { cwd: ctx.directory, root: ctx.worktree },
+              cost: 0,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              modelID: model.id,
+              providerID: model.providerID,
+              time: { created: Date.now() },
               sessionID,
-              parentSessionID: session.parentID,
-              system,
-              messages: [
-                ...modelMsgs,
-                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-              ],
-              tools,
-              model,
-              toolChoice: format.type === "json_schema" ? "required" : undefined,
+            }
+            yield* sessions.updateMessage(msg)
+
+            const finalizeInterruptedAssistant = Effect.gen(function* () {
+              if (msg.time.completed) return
+              msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+                providerID: msg.providerID,
+                aborted: true,
+              })
+              msg.time.completed = Date.now()
+              yield* sessions.updateMessage(msg)
             })
 
-            if (structured !== undefined) {
-              handle.message.structured = structured
-              handle.message.finish = handle.message.finish ?? "stop"
-              yield* sessions.updateMessage(handle.message)
-              return "break" as const
-            }
-
-            const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
-            if (finished && !handle.message.error) {
-              // Surface any content-filter finish (e.g. Anthropic stop_reason:
-              // refusal) as an error. These turns may have produced no visible
-              // output at all — previously the session went idle silently — or
-              // partial text that was cut off by the provider's filter.
-              if (handle.message.finish === "content-filter") {
-                handle.message.error = new SessionV1.ContentFilterError({
-                  message: "The response was blocked by the provider's content filter",
-                }).toObject()
-                yield* sessions.updateMessage(handle.message)
-                yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
-                return "break" as const
-              }
-              if (format.type === "json_schema") {
-                handle.message.error = new SessionV1.StructuredOutputError({
-                  message: "Model did not produce structured output",
-                  retries: 0,
-                }).toObject()
-                yield* sessions.updateMessage(handle.message)
-                return "break" as const
-              }
-            }
-
-            if (result === "stop") return "break" as const
-            if (result === "compact") {
-              yield* compaction.create({
+            const handle = yield* processor
+              .create({
+                assistantMessage: msg,
                 sessionID,
-                agent: lastUser.agent,
-                model: lastUser.model,
-                auto: true,
-                overflow: !handle.message.finish,
+                model,
               })
-            }
-            return "continue" as const
-          }).pipe(
-            Effect.ensuring(instruction.clear(handle.message.id)),
-            Effect.onInterrupt(() => finalizeInterruptedAssistant),
-          )
-          if (outcome === "break") break
-          continue
-        }
+              .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
-        yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
-        return yield* lastAssistant(sessionID)
+            const outcome: "break" | "continue" = yield* Effect.gen(function* () {
+              const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+              const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
+              const promptOps = yield* ops()
+
+              const tools = yield* SessionTools.resolve({
+                agent,
+                session,
+                model,
+                processor: handle,
+                bypassAgentCheck,
+                messages: msgs,
+                promptOps,
+              }).pipe(
+                Effect.provideService(Plugin.Service, plugin),
+                Effect.provideService(Permission.Service, permission),
+                Effect.provideService(ToolRegistry.Service, registry),
+                Effect.provideService(MCP.Service, mcp),
+                Effect.provideService(Truncate.Service, truncate),
+                Effect.provideService(RuntimeFlags.Service, flags),
+              )
+
+              if (lastUser.format?.type === "json_schema") {
+                tools["StructuredOutput"] = createStructuredOutputTool({
+                  schema: lastUser.format.schema,
+                  onSuccess(output) {
+                    structured = output
+                  },
+                })
+              }
+
+              if (step === 1)
+                yield* summary
+                  .summarize({ sessionID, messageID: lastUser.id })
+                  .pipe(Effect.ignore, Effect.forkIn(scope))
+
+              yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+
+              const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+                sys.skills(agent),
+                sys.environment(model),
+                instruction.system().pipe(Effect.orDie),
+                sys.mcp(agent, session.permission),
+                MessageV2.toModelMessagesEffect(msgs, model),
+              ])
+              const system = [
+                ...env,
+                ...instructions,
+                ...(mcpInstructions ? [mcpInstructions] : []),
+                ...(skills ? [skills] : []),
+              ]
+              const cfg = yield* config.get()
+              if (cfg.task_model) {
+                system.push(
+                  "Task model selection is enabled. Distribute load across multiple models by launching subagents concurrently. For each task, specify model_level (1-3) based on task difficulty: 1 = cheapest (small tasks, simple lookups), 2 = everyday (routine work), 3 = best (large-scale or difficult tasks).",
+                )
+              }
+              const format = lastUser.format ?? { type: "text" as const }
+              if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+              const enforceMarker =
+                system.some((s) => s.includes(COMPLETION_MARKER)) ||
+                msgs.some(
+                  (m) =>
+                    m.info.role === "user" &&
+                    "system" in m.info &&
+                    (m.info as SessionV1.User).system?.includes(COMPLETION_MARKER),
+                )
+              if (enforceMarker) system.push(COMPLETION_MARKER_INSTRUCTION)
+              const result = yield* handle.process({
+                user: lastUser,
+                agent,
+                permission: session.permission,
+                sessionID,
+                parentSessionID: session.parentID,
+                system,
+                messages: [
+                  ...modelMsgs,
+                  ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+                ],
+                tools,
+                model,
+                toolChoice: format.type === "json_schema" ? "required" : undefined,
+              })
+
+              if (structured !== undefined) {
+                handle.message.structured = structured
+                handle.message.finish = handle.message.finish ?? "stop"
+                yield* sessions.updateMessage(handle.message)
+                return "break" as const
+              }
+
+              const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
+              if (finished && !handle.message.error) {
+                // Surface any content-filter finish (e.g. Anthropic stop_reason:
+                // refusal) as an error. These turns may have produced no visible
+                // output at all — previously the session went idle silently — or
+                // partial text that was cut off by the provider's filter.
+                if (handle.message.finish === "content-filter") {
+                  handle.message.error = new SessionV1.ContentFilterError({
+                    message: "The response was blocked by the provider's content filter",
+                  }).toObject()
+                  yield* sessions.updateMessage(handle.message)
+                  yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+                  return "break" as const
+                }
+                if (format.type === "json_schema") {
+                  handle.message.error = new SessionV1.StructuredOutputError({
+                    message: "Model did not produce structured output",
+                    retries: 0,
+                  }).toObject()
+                  yield* sessions.updateMessage(handle.message)
+                  return "break" as const
+                }
+              }
+
+              if (handle.message.finish === "stop" && !handle.message.error) {
+                const msgParts = yield* MessageV2.parts(handle.message.id).pipe(
+                  Effect.provideService(Database.Service, database),
+                )
+                const hasReasoning = msgParts.some((p) => p.type === "reasoning")
+                const hasText = msgParts.some((p) => p.type === "text")
+                const hasPendingTool = msgParts.some((p) => p.type === "tool" && !isOrphanedInterruptedTool(p))
+                if (hasReasoning && !hasText && !hasPendingTool) {
+                  reasoningStopRetries++
+                  if (reasoningStopRetries > 2) {
+                    yield* Effect.logWarning("reasoning-stop retries exhausted, breaking loop", {
+                      "session.id": sessionID,
+                      messageID: handle.message.id,
+                    })
+                    return "break" as const
+                  }
+                  yield* Effect.logInfo(
+                    "incomplete step (finish=stop, has reasoning but no text or tool calls), injecting retry prompt",
+                    {
+                      "session.id": sessionID,
+                      messageID: handle.message.id,
+                    },
+                  )
+                  const warnMsg: SessionV1.User = {
+                    id: MessageID.ascending(),
+                    sessionID,
+                    role: "user",
+                    agent: lastUser.agent,
+                    model: lastUser.model,
+                    time: { created: Date.now() },
+                  }
+                  yield* sessions.updateMessage(warnMsg)
+                  yield* sessions.updatePart({
+                    id: PartID.ascending(),
+                    messageID: warnMsg.id,
+                    sessionID,
+                    type: "text",
+                    synthetic: true,
+                    text: REASONING_STOP_WARNING,
+                  })
+                  return "continue" as const
+                }
+              }
+
+              if (result === "stop") return "break" as const
+              if (result === "compact") {
+                yield* compaction.create({
+                  sessionID,
+                  agent: lastUser.agent,
+                  model: lastUser.model,
+                  auto: true,
+                  overflow: !handle.message.finish,
+                })
+                return "continue" as const
+              }
+
+              if (handle.message.finish === "unknown" && !handle.message.error) {
+                yield* Effect.logInfo("interrupted response (finish=unknown), injecting retry prompt", {
+                  "session.id": sessionID,
+                  messageID: handle.message.id,
+                })
+                const warnMsg: SessionV1.User = {
+                  id: MessageID.ascending(),
+                  sessionID,
+                  role: "user",
+                  agent: lastUser.agent,
+                  model: lastUser.model,
+                  time: { created: Date.now() },
+                }
+                yield* sessions.updateMessage(warnMsg)
+                yield* sessions.updatePart({
+                  id: PartID.ascending(),
+                  messageID: warnMsg.id,
+                  sessionID,
+                  type: "text",
+                  synthetic: true,
+                  text: COMPLETION_INTERRUPTED_WARNING,
+                })
+                return "continue" as const
+              }
+
+              if (enforceMarker && finished && !handle.message.error) {
+                const msgParts = yield* MessageV2.parts(handle.message.id).pipe(
+                  Effect.provideService(Database.Service, database),
+                )
+                const textParts = msgParts.filter((p): p is SessionV1.TextPart => p.type === "text")
+                const fullText = textParts.map((p) => p.text).join("")
+                if (fullText.endsWith(COMPLETION_MARKER)) {
+                  const lastText = textParts.at(-1)
+                  if (lastText) {
+                    yield* sessions.updatePart({
+                      ...lastText,
+                      text: lastText.text.slice(0, -COMPLETION_MARKER.length),
+                    })
+                  }
+                } else {
+                  yield* Effect.logInfo("missing completion marker, injecting retry prompt", {
+                    "session.id": sessionID,
+                    messageID: handle.message.id,
+                  })
+                  const warnMsg: SessionV1.User = {
+                    id: MessageID.ascending(),
+                    sessionID,
+                    role: "user",
+                    agent: lastUser.agent,
+                    model: lastUser.model,
+                    time: { created: Date.now() },
+                  }
+                  yield* sessions.updateMessage(warnMsg)
+                  yield* sessions.updatePart({
+                    id: PartID.ascending(),
+                    messageID: warnMsg.id,
+                    sessionID,
+                    type: "text",
+                    synthetic: true,
+                    text: COMPLETION_MARKER_MISSING_WARNING,
+                  })
+                  return "continue" as const
+                }
+              }
+
+              return "continue" as const
+            }).pipe(
+              Effect.ensuring(instruction.clear(handle.message.id)),
+              Effect.onInterrupt(() => finalizeInterruptedAssistant),
+            )
+            if (outcome === "break") break
+            continue
+          }
+
+          yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
+          return yield* lastAssistant(sessionID)
+        })
       },
     )
 
@@ -1346,11 +1527,604 @@ const layer = Layer.effect(
       return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
     })
 
+    const loopRun: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.BusyError> =
+      Effect.fn("SessionPrompt.loopRun")(function* (input: PromptInput) {
+        const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+        yield* revert.cleanup(session)
+        yield* createUserMessage(input)
+        yield* sessions.touch(input.sessionID)
+        return yield* state.tryRun(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      })
+
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
       const ready = yield* Latch.make()
       return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
+    })
+
+    const activeCycles = new Map<SessionID, Loop.LoopState>()
+
+    const noReply = (sessionID: SessionID, messageID: MessageID | undefined, text: string) =>
+      prompt({ sessionID, messageID, noReply: true, parts: [{ type: "text" as const, text }] })
+
+    const publishCycleState = (sessionID: SessionID, state: Loop.LoopState | null) =>
+      events.publish(LoopEvent.Updated, {
+        sessionID,
+        ...(state
+          ? {
+              state: {
+mode: "cycle" as const,
+                intervalStr: state.intervalStr,
+                rounds: state.rounds,
+                startedAt: state.startedAt,
+                nextRunAt: state.nextRunAt,
+                paused: state.paused,
+                pending: state.pending,
+                running: state.running,
+                consecutiveFailures: state.consecutiveFailures,
+                consecutiveDry: state.consecutiveDry,
+                coalescedCount: state.coalescedCount,
+                lastStatus: state.lastStatus,
+              },
+            }
+          : {}),
+      })
+
+    const startLoopFiber = Effect.fn("SessionPrompt.startLoopFiber")(function* (input: {
+      sessionID: SessionID
+      intervalStr: string
+      schedule: Loop.ScheduleInfo
+      nextRunAt: number
+      startRound: number
+      startedAt: number
+      paused: boolean
+      consecutiveFailures: number
+      consecutiveDry: number
+      coalescedCount: number
+      lastStatus?: "success" | "fail"
+    }) {
+      const queue = yield* Queue.dropping<void>(1)
+      const runtime: { state?: Loop.LoopState } = {}
+      const word = "Cycle"
+      const buildPrompt = (round: number) =>
+        Loop.buildCyclePrompt(round)
+      // Last busy→idle transition for this session; drives the cycle mode's
+      // idle-anchored schedule. Bootstrapped to the fiber start so a cycle
+      // started on a long-idle session fires on time.
+      const lastIdleAt = yield* Ref.make(input.startedAt)
+      const persist = Effect.suspend(() => {
+        const current = runtime.state
+        if (!current) return Effect.void
+        return Loop.persistLoopState(storage, input.sessionID, Loop.serializeLoopState(current))
+      })
+      const trigger = Effect.fnUntraced(function* (opts?: { queueWhenBusy?: boolean }) {
+        const current = runtime.state
+        if (!current) return
+        // Ticks that arrive while paused must not queue work or inflate the
+        // coalesced counter; the ticker simply advances to the next anchor.
+        if (current.paused) return
+        const st = yield* status.get(input.sessionID).pipe(Effect.catchCause(() => Effect.succeed({ type: "idle" as const })))
+        if (st.type === "busy" && !opts?.queueWhenBusy) {
+          current.coalescedCount++
+          yield* persist
+          yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
+          return
+        }
+        const accepted = yield* Queue.offer(queue, undefined)
+        if (!accepted) current.coalescedCount++
+        current.pending = true
+        yield* persist
+        yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
+      })
+
+      const ticker = Effect.forever(
+        Effect.gen(function* () {
+          const current = runtime.state
+          if (!current) return yield* Effect.never
+          const now = yield* Clock.currentTimeMillis
+          yield* Effect.sleep(Duration.millis(Math.max(0, current.nextRunAt - now)))
+          const wakeAt = yield* Clock.currentTimeMillis
+          // Idle-anchored scheduling: fire only once the session has been
+          // idle for the full interval, otherwise re-anchor to the target.
+          const intervalMs = current.schedule.intervalMs
+          const defer = Effect.fnUntraced(function* (target: number) {
+            current.nextRunAt = target
+            yield* persist
+            if (!current.paused && !current.running) {
+              yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
+            }
+          })
+          if (current.paused) return yield* defer(wakeAt + intervalMs)
+          const st = yield* status
+            .get(input.sessionID)
+            .pipe(Effect.catchCause(() => Effect.succeed({ type: "idle" as const })))
+          if (st.type === "busy") return yield* defer(wakeAt + intervalMs)
+          const idleTarget = (yield* Ref.get(lastIdleAt)) + intervalMs
+          if (idleTarget > wakeAt) return yield* defer(idleTarget)
+          yield* defer(wakeAt + intervalMs)
+          yield* trigger().pipe(Effect.catchCause(() => Effect.void))
+        }),
+      )
+
+      const idleWatch =
+        events.subscribe(SessionStatusEvent.Status).pipe(
+              Stream.runForEach((event) =>
+                Effect.gen(function* () {
+                  if (event.data.sessionID !== input.sessionID) return
+                  if (event.data.status.type !== "idle") return
+                  yield* Ref.set(lastIdleAt, yield* Clock.currentTimeMillis)
+                }),
+              ),
+            )
+
+      const worker = Effect.gen(function* () {
+        while (true) {
+          yield* Queue.take(queue)
+          const current = runtime.state
+          if (!current) return
+          // Wait out pauses and busy sessions instead of dropping the queued
+          // round: explicit triggers (/loop run, resume) are queued behind busy
+          // work, and a scheduled tick can race ahead of a user turn starting.
+          while (true) {
+            const st = yield* status.get(input.sessionID).pipe(Effect.catchCause(() => Effect.succeed({ type: "idle" as const })))
+            if (!current.paused && st.type !== "busy") break
+            yield* Effect.sleep(Duration.millis(100))
+          }
+          while (Option.isSome(yield* Queue.poll(queue))) current.coalescedCount++
+          // A deleted session can no longer host rounds; stop cleanly instead
+          // of grinding through the consecutive-failure auto-stop threshold.
+          const gone = yield* sessions.get(input.sessionID).pipe(Effect.option, Effect.map(Option.isNone))
+          if (gone) {
+            yield* Effect.logInfo("loop session deleted; stopping", { "session.id": input.sessionID })
+            yield* Loop.clearPersistedState(storage, input.sessionID)
+            yield* publishCycleState(input.sessionID, null).pipe(Effect.ignore)
+            return
+          }
+          current.pending = false
+          current.running = true
+          yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
+
+          const round = current.rounds + 1
+          const exit = yield* Effect.gen(function* () {
+            const fullPrompt = buildPrompt(round)
+            const before = yield* sessions.messages({ sessionID: input.sessionID, limit: 1 }).pipe(Effect.orDie)
+            const boundaryId = before[0]?.info.id
+            const result = yield* loopRun({
+              sessionID: input.sessionID,
+              model: yield* currentModel(input.sessionID),
+              parts: [{ type: "text" as const, text: fullPrompt }],
+            })
+            // The boundary check alone misses mid-round aborts: onInterrupt
+            // resolves with the current round's own aborted assistant message,
+            // which is newer than the boundary.
+            const aborted = result.info.role === "assistant" && result.info.error?.name === "MessageAbortedError"
+            const interrupted = aborted || (boundaryId ? result.info.id <= boundaryId : false)
+            return { fullPrompt, boundaryId, result, interrupted }
+          }).pipe(
+            Effect.map((data) =>
+              data.interrupted
+                ? ({ _tag: "interrupted" as const, fullPrompt: data.fullPrompt })
+                : ({ _tag: "success" as const, ...data }),
+            ),
+            Effect.catchTag("SessionBusyError", () => Effect.succeed({ _tag: "coalesced" as const })),
+            Effect.catchCause((cause) =>
+              Cause.hasInterruptsOnly(cause)
+                ? Effect.interrupt
+                : Effect.sync(() => ({ _tag: "fail" as const, cause })),
+            ),
+          )
+
+          current.running = false
+          // The round's busy→idle transition is known here deterministically;
+          // recording it closes the event-delivery window in which the cycle
+          // ticker could read a stale lastIdleAt and fire a round early. User
+          // work still relies on the idleWatch subscription.
+          yield* Ref.set(lastIdleAt, yield* Clock.currentTimeMillis)
+          if (exit._tag === "coalesced") {
+            current.coalescedCount++
+            yield* persist
+            yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
+            continue
+          }
+          current.rounds = round
+          if (exit._tag === "success") {
+            current.consecutiveFailures = 0
+            current.lastStatus = "success"
+            const roundMsgs = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+            const hasFileModification = roundMsgs.some(
+              (msg) =>
+                msg.info.role === "assistant" &&
+                (!exit.boundaryId || msg.info.id > exit.boundaryId) &&
+                msg.parts.some(
+                  (part) =>
+                    part.type === "tool" &&
+                    part.tool !== undefined &&
+                    FILE_MODIFY_TOOLS.has(part.tool) &&
+                    part.state?.status === "completed",
+                ),
+            )
+            if (hasFileModification) {
+              current.consecutiveDry = 0
+            } else {
+              current.consecutiveDry++
+            }
+            yield* Loop.persistRoundResult(storage, input.sessionID, round, {
+              timestamp: yield* Clock.currentTimeMillis,
+              prompt: exit.fullPrompt,
+              status: "success",
+              response: exit.result.parts
+                .filter((part): part is SessionV1.TextPart => part.type === "text")
+                .map((part) => part.text)
+                .join("\n")
+                .slice(0, 5000),
+            })
+            if (current.consecutiveDry >= Loop.loopConfig.maxDryIterations) {
+              const announce = !current.paused
+              current.paused = true
+              yield* persist
+              yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
+              // A user pause that landed mid-round already told the user about
+              // the pause; only announce auto-pauses.
+              if (announce) {
+                yield* noReply(
+                  input.sessionID,
+                  undefined,
+                  `[${word} #${round}] Paused after ${Loop.loopConfig.maxDryIterations} consecutive iterations with no file modifications. Use /cycle resume to continue.`,
+                )
+              }
+              continue
+            }
+          } else if (exit._tag === "interrupted") {
+            // A user abort is a skipped round, not a failure: it must not
+            // count toward consecutiveFailures or the auto-stop threshold.
+            // Aborting an automated round means the user wants the automation
+            // to hold, so pause instead of firing the next scheduled round.
+            current.paused = true
+            yield* noReply(
+              input.sessionID,
+              undefined,
+              `[${word} #${round}] Iteration interrupted; cycle paused. Use /cycle resume to continue.`,
+            )
+            yield* Loop.persistRoundResult(storage, input.sessionID, round, {
+              timestamp: yield* Clock.currentTimeMillis,
+              prompt: exit.fullPrompt,
+              status: "interrupted",
+              response: "Iteration was interrupted",
+            })
+          } else {
+            current.consecutiveFailures++
+            current.lastStatus = "fail"
+            const errorMsg = Cause.pretty(exit.cause).slice(0, 200)
+            yield* Effect.logError("loop iteration failed", {
+              "session.id": input.sessionID,
+              round,
+              cause: Cause.pretty(exit.cause),
+            })
+            yield* noReply(input.sessionID, undefined, `[${word} #${round}] Iteration failed: ${errorMsg}`)
+            yield* Loop.persistRoundResult(storage, input.sessionID, round, {
+              timestamp: yield* Clock.currentTimeMillis,
+              prompt: buildPrompt(round),
+              status: "fail",
+              response: errorMsg,
+            })
+            if (current.consecutiveFailures >= Loop.loopConfig.maxConsecutiveFailures) {
+              yield* Loop.clearPersistedState(storage, input.sessionID)
+              yield* publishCycleState(input.sessionID, null).pipe(Effect.ignore)
+              yield* noReply(
+                input.sessionID,
+                undefined,
+                `[${word}] Auto-stopped after ${Loop.loopConfig.maxConsecutiveFailures} consecutive failures. Last error: ${errorMsg}`,
+              )
+              return
+            }
+          }
+
+          yield* persist
+          yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
+        }
+      })
+
+      const program = worker.pipe(
+        Effect.raceFirst(ticker),
+        Effect.raceFirst(idleWatch),
+        Effect.asVoid,
+        Effect.ensuring(
+          Effect.gen(function* () {
+            if (activeCycles.get(input.sessionID) === runtime.state) activeCycles.delete(input.sessionID)
+            yield* Loop.clearPersistedState(storage, input.sessionID).pipe(Effect.ignore)
+            yield* publishCycleState(input.sessionID, null).pipe(Effect.ignore)
+          }),
+        ),
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.interrupt
+            : Effect.logWarning("loop scheduler ended", { "session.id": input.sessionID, cause: Cause.pretty(cause) }),
+        ),
+      )
+      const fiber = yield* program.pipe(Effect.forkIn(scope))
+      const loopState: Loop.LoopState = {
+        version: 1,
+        intervalStr: input.intervalStr,
+        schedule: input.schedule,
+        rounds: input.startRound,
+        fiber,
+        trigger,
+        startedAt: input.startedAt,
+        nextRunAt: input.nextRunAt,
+        paused: input.paused,
+        pending: false,
+        running: false,
+        consecutiveFailures: input.consecutiveFailures,
+        consecutiveDry: input.consecutiveDry,
+        coalescedCount: input.coalescedCount,
+        lastStatus: input.lastStatus,
+        timezone: Loop.timezone(),
+      }
+      runtime.state = loopState
+      activeCycles.set(input.sessionID, loopState)
+      yield* persist
+      yield* publishCycleState(input.sessionID, loopState).pipe(Effect.ignore)
+      return loopState
+    })
+
+    const activateLoop = Effect.fn("SessionPrompt.activateLoop")(function* (input: {
+      sessionID: SessionID
+      intervalStr: string
+      schedule: Loop.ScheduleInfo
+      nextRunAt: number
+      startedAt: number
+      replace: boolean
+      announce?: boolean
+      messageID?: MessageID
+    }) {
+      const existing = activeCycles.get(input.sessionID)
+      if (existing && !input.replace) {
+        return { text: `A cycle is already active for this session. Use /cycle stop first or request replacement.` }
+      }
+      if (existing) {
+        yield* Fiber.interrupt(existing.fiber)
+        yield* Loop.clearPersistedState(storage, input.sessionID)
+      }
+
+      const text = `Cycle started: ${input.intervalStr}; first run ${new Date(input.nextRunAt).toTimeString().slice(0, 5)}; runs until stopped`
+      const message = input.announce ? yield* noReply(input.sessionID, input.messageID, text) : undefined
+      const state = yield* startLoopFiber({
+        sessionID: input.sessionID,
+        intervalStr: input.intervalStr,
+        schedule: input.schedule,
+        nextRunAt: input.nextRunAt,
+        startRound: 0,
+        startedAt: input.startedAt,
+        paused: false,
+        consecutiveFailures: 0,
+        consecutiveDry: 0,
+        coalescedCount: 0,
+      })
+      return { text, message }
+    })
+
+    const handleAutomationCommand = Effect.fn("SessionPrompt.automationCommand")(function* (
+      input: CommandInput,
+    ) {
+      const raw = input.arguments.match(argsRegex) ?? []
+      const args = raw.map((arg) => arg.replace(quoteTrimRegex, ""))
+      const subcommand = args[0]
+      const usageText = "Usage: /cycle [start] <interval> [--replace]"
+      const helpText = [
+        usageText,
+        "",
+        "Subcommands:",
+        "  start    Optional alias for starting a cycle",
+        "  stop     Stop the active cycle for this session",
+        "  pause    Temporarily pause the cycle (preserves round count)",
+        "  resume   Resume a paused cycle",
+        "  run      Force the next cycle iteration now instead of waiting",
+        "  status   Show the current cycle status",
+        "",
+        "Start syntax:",
+        "  /cycle [start] <interval> [--replace]",
+        "  Add --replace to replace the active cycle",
+        "",
+        `Minimum interval: ${Loop.loopConfig.minIntervalMs / 1000}s`,
+        `Auto-stops after ${Loop.loopConfig.maxConsecutiveFailures} consecutive failures`,
+        `Auto-pauses after ${Loop.loopConfig.maxDryIterations} consecutive rounds with no file modifications`,
+        "",
+        "Examples:",
+        "  /cycle 5m",
+        "  /cycle 5m --replace",
+        "  /cycle stop",
+        "  /cycle pause",
+        "  /cycle resume",
+        "  /cycle status",
+        "  /cycle run",
+        "",
+        "Intervals: ms, s, m, h (e.g. 30s, 5m, 1h, 2h30m)",
+        "Cycles are idle-anchored: each iteration starts <interval> after the",
+        "session became idle, not on a wall-clock schedule.",
+        "",
+        "Only one automation can be active per session.",
+        "Cycle state and the latest 100 round results are saved in application data.",
+      ].join("\n")
+      const startsLoop =
+        subcommand === "start" || subcommand === "at" || Loop.parseDuration(subcommand ?? "") !== undefined
+
+      if (startsLoop) {
+        if (subcommand === "at" || (subcommand === "start" && args[1] === "at")) {
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            `Cycles only support intervals; clock-time schedules are not supported.\n\n${usageText}`,
+          )
+        }
+        const values = subcommand === "start" ? args.slice(1) : args
+        const now = yield* Clock.currentTimeMillis
+        let schedule: Loop.ScheduleInfo
+        let intervalStr: string
+        let nextRunAt: number
+
+        const intervalStrRaw = values[0]
+        const intervalMs = intervalStrRaw ? Loop.parseDuration(intervalStrRaw) : undefined
+        if (!intervalMs) {
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            intervalStrRaw
+              ? `Invalid interval: "${intervalStrRaw}". Supported units: ms, s, m, h (e.g. 5m, 30s, 1h)`
+              : helpText,
+          )
+        }
+        if (intervalMs < Loop.loopConfig.minIntervalMs) {
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            `Minimum interval is ${Loop.loopConfig.minIntervalMs / 1000}s. Use ${Loop.loopConfig.minIntervalMs / 1000}s or greater.`,
+          )
+        }
+        schedule = { type: "cycle", intervalMs }
+        intervalStr = `every ${intervalStrRaw}`
+        nextRunAt = now + intervalMs
+
+        let replace = false
+        for (let index = 1; index < values.length; index++) {
+          const value = values[index]
+          if (value === "--replace") {
+            replace = true
+            continue
+          }
+          return yield* noReply(input.sessionID, input.messageID, `Unexpected argument: "${value}".\n\n${usageText}`)
+        }
+
+        const result = yield* activateLoop({
+          sessionID: input.sessionID,
+          intervalStr,
+          schedule,
+          nextRunAt,
+          startedAt: now,
+          replace,
+          announce: true,
+          messageID: input.messageID,
+        })
+        return result.message ?? (yield* noReply(input.sessionID, input.messageID, result.text))
+      }
+
+      if (subcommand === "stop") {
+        const existing = activeCycles.get(input.sessionID)
+        if (!existing) {
+          return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
+        }
+        const rounds = existing.rounds
+        const failures = existing.consecutiveFailures
+        const coalesced = existing.coalescedCount
+        yield* Fiber.interrupt(existing.fiber)
+        activeCycles.delete(input.sessionID)
+        yield* Loop.clearPersistedState(storage, input.sessionID)
+        yield* publishCycleState(input.sessionID, null).pipe(Effect.ignore)
+        const parts = [`ran ${rounds} rounds`]
+        if (failures > 0) parts.push(`${failures} consecutive failures`)
+        if (coalesced > 0) parts.push(`${coalesced} ticks coalesced`)
+        return yield* noReply(input.sessionID, input.messageID, `Cycle stopped (${parts.join(", ")}).`)
+      }
+
+      if (subcommand === "status") {
+        const existing = activeCycles.get(input.sessionID)
+        if (existing) {
+          const stateInfo = existing.paused
+            ? existing.consecutiveDry >= Loop.loopConfig.maxDryIterations
+              ? ` (paused after ${existing.consecutiveDry} idle retries)`
+              : " (paused)"
+            : existing.running
+              ? " (running)"
+              : existing.pending
+                ? " (queued)"
+                : ""
+          const parts = [`${existing.rounds} rounds completed`]
+          if (existing.consecutiveFailures > 0) parts.push(`${existing.consecutiveFailures} consecutive failures`)
+          if (existing.consecutiveDry > 0) parts.push(`${existing.consecutiveDry}/${Loop.loopConfig.maxDryIterations} consecutive idle iterations`)
+          if (existing.coalescedCount > 0) parts.push(`${existing.coalescedCount} ticks coalesced`)
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            `Cycle active: ${existing.intervalStr}${stateInfo}, ${parts.join(", ")}`,
+          )
+        }
+        return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
+      }
+
+      if (subcommand === "pause") {
+        const existing = activeCycles.get(input.sessionID)
+        if (!existing) {
+          return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
+        }
+        if (existing.paused) {
+          return yield* noReply(input.sessionID, input.messageID, `Cycle is already paused.`)
+        }
+        existing.paused = true
+        yield* Loop.persistLoopState(storage, input.sessionID, Loop.serializeLoopState(existing))
+        yield* publishCycleState(input.sessionID, existing).pipe(Effect.ignore)
+        return yield* noReply(
+          input.sessionID,
+          input.messageID,
+          `Cycle paused after ${existing.rounds} rounds. Use /cycle resume to continue.`,
+        )
+      }
+
+      if (subcommand === "resume") {
+        const existing = activeCycles.get(input.sessionID)
+        if (!existing) {
+          return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
+        }
+        if (!existing.paused) {
+          return yield* noReply(input.sessionID, input.messageID, `Cycle is not paused.`)
+        }
+        existing.paused = false
+        existing.consecutiveDry = 0
+        existing.consecutiveFailures = 0
+        const now = yield* Clock.currentTimeMillis
+        const nextRunAt = Loop.nextScheduledAt(existing.schedule, now)
+        if (nextRunAt) existing.nextRunAt = nextRunAt
+        yield* Loop.persistLoopState(storage, input.sessionID, Loop.serializeLoopState(existing))
+        yield* publishCycleState(input.sessionID, existing).pipe(Effect.ignore)
+        const st = yield* status.get(input.sessionID).pipe(Effect.catchCause(() => Effect.succeed({ type: "idle" as const })))
+        yield* existing.trigger({ queueWhenBusy: true })
+        return yield* noReply(
+          input.sessionID,
+          input.messageID,
+          st.type === "busy"
+            ? `Cycle resumed; a run will start after the current work finishes. ${existing.rounds} rounds completed so far.`
+            : `Cycle resumed; a run is starting now. ${existing.rounds} rounds completed so far.`,
+        )
+      }
+
+      if (subcommand === "run") {
+        const existing = activeCycles.get(input.sessionID)
+        if (!existing) {
+          return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
+        }
+        if (existing.paused) {
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            `Cycle is paused. Use /cycle resume first.`,
+          )
+        }
+        const busy = (yield* status.get(input.sessionID).pipe(Effect.catchCause(() => Effect.succeed({ type: "idle" as const })))).type === "busy"
+        yield* existing.trigger({ queueWhenBusy: true })
+        if (busy) {
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            `Cycle is busy; this run will start after the current one finishes.`,
+          )
+        }
+        return yield* noReply(input.sessionID, input.messageID, `Cycle triggered: next run starting now.`)
+      }
+
+      if (!subcommand || subcommand === "help") {
+        return yield* noReply(input.sessionID, input.messageID, helpText)
+      }
+
+      return yield* noReply(input.sessionID, input.messageID, `Unknown subcommand: "${subcommand}".\n\n${helpText}`)
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
@@ -1359,6 +2133,7 @@ const layer = Layer.effect(
         command: input.command,
         agent: input.agent,
       })
+      if (input.command === "cycle" || input.command === "loop") return yield* handleAutomationCommand(input)
       const cmd = yield* commands.get(input.command)
       if (!cmd) {
         const available = (yield* commands.list()).map((c) => c.name)
@@ -1480,13 +2255,94 @@ const layer = Layer.effect(
       return result
     })
 
+    const recoverPersistedCycles = Effect.fn("SessionPrompt.recoverPersistedCycles")(function* () {
+      const entries = yield* storage.list(["loop"]).pipe(Effect.orElseSucceed(() => []))
+      for (const key of entries) {
+        if (key.length !== 3 || key[2] !== "state") continue
+        const sessionID = SessionID.make(key[1])
+        if (activeCycles.has(sessionID)) continue
+        yield* Effect.gen(function* () {
+          const recovered = yield* Loop.readPersistedState(storage, sessionID)
+          if (recovered.type !== "found") return
+          const persisted = recovered.state
+          const now = yield* Clock.currentTimeMillis
+          const nextRunAt = Loop.nextScheduledAt(persisted.schedule, now)
+          if (!nextRunAt) {
+            yield* Loop.clearPersistedState(storage, sessionID)
+            return
+          }
+          // A deleted session can no longer host rounds; stop cleanly.
+          const session = yield* sessions.get(sessionID).pipe(Effect.option)
+          if (Option.isNone(session)) {
+            yield* Loop.clearPersistedState(storage, sessionID)
+            return
+          }
+          // Recovery runs outside any request scope, so the forked loop fiber
+          // would otherwise carry no InstanceRef and every per-instance lookup
+          // (Agent.defaultInfo, model resolution) would die at the first round.
+          const ctx = yield* instanceStore.load({ directory: session.value.directory })
+          yield* startLoopFiber({
+            sessionID,
+            intervalStr: persisted.intervalStr,
+            schedule: persisted.schedule,
+            nextRunAt,
+            startRound: persisted.rounds,
+            startedAt: persisted.startedAt,
+            paused: persisted.paused,
+            consecutiveFailures: persisted.consecutiveFailures,
+            consecutiveDry: persisted.consecutiveDry,
+            coalescedCount: persisted.coalescedCount,
+            lastStatus: persisted.lastStatus,
+          }).pipe(Effect.provideService(InstanceRef, ctx))
+          yield* Effect.logInfo("loop auto-recovered", { "session.id": sessionID, rounds: persisted.rounds })
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.logError("loop recovery failed", { "session.id": sessionID, cause: Cause.pretty(cause) }),
+          ),
+        )
+      }
+    })
+
+    yield* recoverPersistedCycles().pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logError("loop recovery failed", { cause: Cause.pretty(cause) }),
+      ),
+    )
+
+    const loopState = Effect.fn("SessionPrompt.loopState")(function* () {
+      const result: Record<string, LoopEvent.LoopState> = {}
+      for (const [sessionID, state] of activeCycles) {
+        result[sessionID] = {
+          mode: "cycle" as const,
+          intervalStr: state.intervalStr,
+          rounds: state.rounds,
+          startedAt: state.startedAt,
+          nextRunAt: state.nextRunAt,
+          paused: state.paused,
+          pending: state.pending,
+          running: state.running,
+          consecutiveFailures: state.consecutiveFailures,
+          consecutiveDry: state.consecutiveDry,
+          coalescedCount: state.coalescedCount,
+          lastStatus: state.lastStatus,
+        }
+      }
+      return result
+    })
+
     return Service.of({
       cancel,
       prompt,
+      loopRun,
       loop,
       shell,
       command,
       resolvePromptParts,
+      loopState,
     })
   }),
 )
@@ -1595,6 +2451,8 @@ const argsRegex = /(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi
 const placeholderRegex = /\$(\d+)/g
 const quoteTrimRegex = /^["']|["']$/g
 
+export { loopConfig } from "./loop"
+
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
@@ -1625,6 +2483,8 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    Storage.node,
+    InstanceStore.node,
   ],
 })
 

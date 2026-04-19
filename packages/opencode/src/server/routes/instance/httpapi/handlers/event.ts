@@ -2,6 +2,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { GlobalBus } from "@/bus/global"
 import { EventV2 } from "@opencode-ai/core/event"
+import { SessionPrompt } from "@/session/prompt"
 import { Effect, Queue } from "effect"
 import * as Stream from "effect/Stream"
 import { HttpServerResponse } from "effect/unstable/http"
@@ -22,7 +23,7 @@ function eventID() {
   return EventV2.ID.create()
 }
 
-function eventResponse(events: EventV2.Interface) {
+function eventResponse(events: EventV2.Interface, sessionPrompt: SessionPrompt.Interface) {
   return Effect.gen(function* () {
     const instance = yield* InstanceState.context
     const workspaceID = yield* InstanceState.workspaceID
@@ -66,8 +67,15 @@ function eventResponse(events: EventV2.Interface) {
     )
 
     yield* Effect.logInfo("event connected")
+    const loopStates = yield* sessionPrompt.loopState()
+    const loopEvents = Object.entries(loopStates).map(([sessionID, state]) => ({
+      id: eventID(),
+      type: "session.loop.updated" as const,
+      properties: { sessionID, state },
+    }))
     return HttpServerResponse.stream(
       Stream.make({ id: eventID(), type: "server.connected", properties: {} }).pipe(
+        Stream.concat(Stream.fromIterable(loopEvents)),
         Stream.concat(output.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
         Stream.map(eventData),
         Stream.pipeThroughChannel(Sse.encode()),
@@ -89,10 +97,11 @@ function eventResponse(events: EventV2.Interface) {
 export const eventHandlers = HttpApiBuilder.group(EventApi, "event", (handlers) =>
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const sessionPrompt = yield* SessionPrompt.Service
     return handlers.handleRaw(
       "subscribe",
       Effect.fn("EventHttpApi.subscribe")(function* () {
-        return yield* eventResponse(events)
+        return yield* eventResponse(events, sessionPrompt)
       }),
     )
   }),

@@ -229,6 +229,8 @@ describe("opencode run (non-interactive subprocess)", () => {
 
         const events = opencode.parseJsonEvents(result.stdout)
         expect(result.exitCode).toBe(0)
+        // The unknown-finish step is retried with an injected prompt; the mock
+        // serves its fallback "ok" response in the final step.
         expect(events.map((event) => event.type)).toEqual([
           "step_start",
           "text",
@@ -256,8 +258,10 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.text("continued after rejection")
         const denied = yield* opencode.run("request permission", { permission: { bash: "ask" } })
         opencode.expectExit(denied, 0)
-        expect(denied.stderr).toContain("permission requested: bash")
-        expect(denied.stdout).toBe("")
+        // Non-interactive runs cannot ask, so an "ask" outcome is denied
+        // inline (question rule denied) and fed back as a tool error.
+        expect(denied.stderr).toContain("prevents you from using this specific tool call")
+        expect(denied.stdout).toBe("continued after rejection\n")
 
         yield* llm.reset
         yield* llm.tool("bash", { command: "rm -f allowed-file", description: "Remove a test file" })

@@ -246,6 +246,7 @@ export class RunFooter implements FooterApi {
       first: options.first,
       interrupt: 0,
       exit: 0,
+      loop: null,
     })
     this.state = state
     this.setState = setState
@@ -296,6 +297,8 @@ export class RunFooter implements FooterApi {
     this.renderer.on(CliRenderEvents.THEME_MODE, this.handleThemeRefresh)
     this.renderer.prependInputHandler(this.handleThemeNotification)
     process.on("SIGUSR2", this.handleThemeSignal)
+
+    this.applyHeight()
 
     const footer = this
     void render(
@@ -497,6 +500,7 @@ export class RunFooter implements FooterApi {
           : prev.interrupt,
       exit:
         typeof next.exit === "number" && Number.isFinite(next.exit) ? Math.max(0, Math.floor(next.exit)) : prev.exit,
+      loop: next.loop !== undefined ? next.loop : prev.loop,
     }
 
     if (state.phase === "idle") {
@@ -504,6 +508,10 @@ export class RunFooter implements FooterApi {
     }
 
     this.setState(state)
+
+    if (prev.loop !== state.loop) {
+      this.applyHeight()
+    }
 
     if (prev.phase === "running" && state.phase === "idle") {
       this.flush()
@@ -695,6 +703,7 @@ export class RunFooter implements FooterApi {
   // get fixed extra rows; the prompt view scales with textarea line count.
   private applyHeight(): void {
     const type = this.view().type
+    const loopOffset = this.state().loop ? 1 : 0
     const height =
       type === "permission"
         ? this.base + PERMISSION_ROWS
@@ -714,7 +723,7 @@ export class RunFooter implements FooterApi {
                       ? 1 + this.subagentMenuRows
                       : this.promptRoute.type === "subagent"
                         ? this.base + SUBAGENT_INSPECTOR_ROWS
-                        : this.base + Math.max(TEXTAREA_MIN_ROWS, Math.min(PROMPT_MAX_ROWS, this.rows))
+                        : this.base + loopOffset + Math.max(TEXTAREA_MIN_ROWS, Math.min(PROMPT_MAX_ROWS, this.rows))
 
     if (height !== this.renderer.footerHeight) {
       this.renderer.footerHeight = height
