@@ -1,5 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Deferred, Effect, Layer, Schema, Context } from "effect"
+import { Cause, Deferred, Effect, Exit, Layer, Schema, Context } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionID } from "@/session/schema"
 import { QuestionID } from "./schema"
@@ -74,6 +74,9 @@ const layer = Layer.effect(
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             for (const item of state.pending.values()) {
+              // Clients clear the question UI only on replied/rejected events,
+              // so disposal must publish one or the request haunts the UI.
+              yield* events.publish(Event.Rejected, { sessionID: item.info.sessionID, requestID: item.info.id })
               yield* Deferred.fail(item.deferred, new RejectedError())
             }
             state.pending.clear()
@@ -103,11 +106,19 @@ const layer = Layer.effect(
       pending.set(id, { info, deferred })
       yield* events.publish(Event.Asked, info)
 
-      return yield* Effect.ensuring(
-        Deferred.await(deferred),
-        Effect.sync(() => {
-          pending.delete(id)
-        }),
+      return yield* Deferred.await(deferred).pipe(
+        Effect.onExit(
+          Effect.fnUntraced(function* (exit: Exit.Exit<ReadonlyArray<Answer>, RejectedError>) {
+            const removed = pending.delete(id)
+            // Interruption (turn aborted, instance disposed) otherwise removes the
+            // pending entry silently; clients only clear the question UI on
+            // replied/rejected events, so notify them or the request haunts the UI.
+            if (!removed) return
+            if (!Exit.isFailure(exit) || !Cause.hasInterruptsOnly(exit.cause)) return
+            yield* Effect.logInfo("interrupted while pending", { requestID: id })
+            yield* events.publish(Event.Rejected, { sessionID: input.sessionID, requestID: id })
+          }),
+        ),
       )
     })
 

@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
 import { InstanceState } from "@/effect/instance-state"
 import { Wildcard } from "@opencode-ai/core/util/wildcard"
-import { Deferred, Effect, Layer, Context } from "effect"
+import { Cause, Deferred, Effect, Exit, Layer, Context } from "effect"
 import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -54,6 +54,13 @@ const layer = Layer.effect(
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             for (const item of state.pending.values()) {
+              // Clients clear the permission UI only on permission.replied events,
+              // so disposal must publish one or the request haunts the UI.
+              yield* events.publish(Event.Replied, {
+                sessionID: item.info.sessionID,
+                requestID: item.info.id,
+                reply: "reject",
+              })
               yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
             }
             state.pending.clear()
@@ -105,11 +112,19 @@ const layer = Layer.effect(
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
       pending.set(id, { info, deferred })
       yield* events.publish(Event.Asked, info)
-      return yield* Effect.ensuring(
-        Deferred.await(deferred),
-        Effect.sync(() => {
-          pending.delete(id)
-        }),
+      return yield* Deferred.await(deferred).pipe(
+        Effect.onExit(
+          Effect.fnUntraced(function* (exit: Exit.Exit<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>) {
+            const removed = pending.delete(id)
+            // Interruption (turn aborted, instance disposed) otherwise removes the
+            // pending entry silently; clients only clear the permission UI on
+            // permission.replied events, so notify them or the request haunts the UI.
+            if (!removed) return
+            if (!Exit.isFailure(exit) || !Cause.hasInterruptsOnly(exit.cause)) return
+            yield* Effect.logInfo("interrupted while pending", { requestID: id })
+            yield* events.publish(Event.Replied, { sessionID: info.sessionID, requestID: id, reply: "reject" })
+          }),
+        ),
       )
     })
 
