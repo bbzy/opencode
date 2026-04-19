@@ -309,6 +309,18 @@ describe("session.retry.retryable", () => {
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Service unavailable" })
   })
 
+  test("retries astra 494 proxy internal errors", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "ASTRA_SYS_ERR: proxy internal error 0",
+        isRetryable: false,
+        statusCode: 494,
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, "astra")).toEqual({ message: "ASTRA_SYS_ERR: proxy internal error 0" })
+  })
+
   test("does not retry 4xx errors when isRetryable is false", () => {
     const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
       new SessionV1.APIError({
