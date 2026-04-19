@@ -7,11 +7,17 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Session } from "@/session/session"
 import { SessionPrompt } from "../../src/session/prompt"
 import { MessageV2 } from "../../src/session/message-v2"
+import { InstanceStore } from "@/project/instance-store"
+import { instanceStoreStub } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
 // Skip tests if no API key is available
 const hasApiKey = !!process.env.ANTHROPIC_API_KEY
-const it = testEffect(AppNodeBuilder.build(LayerNode.group([SessionPrompt.node, Session.node, Ripgrep.node])))
+const it = testEffect(
+  AppNodeBuilder.build(LayerNode.group([SessionPrompt.node, Session.node, Ripgrep.node]), [
+    [InstanceStore.node, instanceStoreStub],
+  ]),
+)
 const live = hasApiKey ? it.instance : it.instance.skip
 
 describe("StructuredOutput Integration", () => {

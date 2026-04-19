@@ -8,6 +8,7 @@ type Opts = {
   attention?: Partial<TuiPluginApi["attention"]>
   event?: TuiPluginApi["event"]
   state?: { session?: Partial<TuiPluginApi["state"]["session"]> }
+  lifecycle?: Partial<TuiPluginApi["lifecycle"]>
 }
 
 export function createTuiPluginApi(opts: Opts = {}) {
@@ -27,6 +28,11 @@ export function createTuiPluginApi(opts: Opts = {}) {
         values.set(name, value)
       },
       ready: true,
+    },
+    lifecycle: {
+      signal: new AbortController().signal,
+      onDispose: () => () => {},
+      ...opts.lifecycle,
     },
     state: { session: { get: () => undefined, ...opts.state?.session } },
     theme: { current: new Proxy({}, { get: () => color }) },

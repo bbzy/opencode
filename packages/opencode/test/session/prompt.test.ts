@@ -6,7 +6,8 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Clock, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import * as Scope from "effect/Scope"
 import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -34,7 +35,8 @@ import { SessionCompaction } from "../../src/session/compaction"
 import { SessionSummary } from "../../src/session/summary"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
-import { SessionPrompt } from "../../src/session/prompt"
+import { SessionPrompt, loopConfig } from "../../src/session/prompt"
+import { Loop } from "@/session/loop"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -50,13 +52,16 @@ import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
-import { TestInstance } from "../fixture/fixture"
+import { instanceStoreStub, TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { InstanceRef } from "@/effect/instance-ref"
+import { InstanceStore } from "@/project/instance-store"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { Storage } from "@/storage/storage"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -206,6 +211,7 @@ const promptRoot = LayerNode.group([
   SystemPrompt.node,
   CrossSpawnSpawner.node,
   RuntimeFlags.node,
+  Storage.node,
 ])
 
 function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
@@ -214,6 +220,7 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
+    [InstanceStore.node, instanceStoreStub],
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -228,6 +235,7 @@ function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processo
     [LSP.node, lsp],
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
+    [InstanceStore.node, instanceStoreStub],
   ] as const
   if (input?.processor === "blocking") {
     return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
@@ -1280,9 +1288,47 @@ raceNoLLMServer.instance(
       if (lastUser?.info.role === "user" && lastAssistant?.info.role === "assistant") {
         expect(lastAssistant.info.parentID).toBe(lastUser?.info.id)
       }
+}),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle second round is idle-anchored (fires interval after round ends, not wall-clock)",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+
+        // Hold round 1's LLM response so the round takes ~500ms to complete.
+        const gate = yield* Deferred.make<void>()
+        yield* llm.hold("round 1", deferredAsPromise(gate))
+        const beforeStart = yield* Clock.currentTimeMillis
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
+        yield* llm.wait(1)
+        // Round 1 is running; ticker defers because current.running.
+        // Release the gate after a short delay so round 1 ends ~500ms after start.
+        yield* Effect.sleep(Duration.millis(400))
+        yield* Deferred.succeed(gate, void 0)
+        // Wait for round 2's LLM call.
+        yield* llm.wait(2)
+        const afterRound2Call = yield* Clock.currentTimeMillis
+        const elapsed = afterRound2Call - beforeStart
+        // If wall-clock anchored, round 2 would fire ~100ms after start, so
+        // elapsed would be ~500ms. With idle-anchored, round 2 fires ~100ms
+        // after round 1 ends (~500ms after start), so elapsed should be ~600ms.
+        expect(elapsed).toBeGreaterThanOrEqual(550)
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
     }),
   { config: cfg },
-  3_000,
+  30_000,
 )
 
 noLLMServer.instance(
@@ -2466,5 +2512,1672 @@ noLLMServer.instance(
         }
       }
     }),
+  30_000,
+)
+
+// ── completion marker ──────────────────────────────────────────────
+
+const MARKER = "<response>complete</response>"
+const MARKER_INSTRUCTION = `At the end of every response, you MUST append the exact string "${MARKER}" to indicate the response is complete.`
+
+it.instance("completion marker: strips marker from displayed text", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "MarkerStrip",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      system: MARKER_INSTRUCTION,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    yield* llm.text("world" + MARKER)
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    const parts = result.parts.filter((p) => p.type === "text")
+    const fullText = parts.map((p) => p.text).join("")
+    expect(fullText).not.toContain(MARKER)
+    expect(fullText).toBe("world")
+    if (result.info.role === "assistant") expect(result.info.finish).toBe("stop")
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+it.instance("completion marker: injects warning and continues when marker is missing", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "MarkerMissing",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      system: MARKER_INSTRUCTION,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    // First response: missing marker — should trigger warning + retry
+    yield* llm.text("incomplete response")
+    // Second response: has marker — should be accepted and stripped
+    yield* llm.text("now complete" + MARKER)
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    // Should have made 2 LLM calls
+    expect(yield* llm.hits).toHaveLength(2)
+
+    // Final response text should not contain marker
+    const parts = result.parts.filter((p) => p.type === "text")
+    const fullText = parts.map((p) => p.text).join("")
+    expect(fullText).not.toContain(MARKER)
+    expect(fullText).toBe("now complete")
+
+    // Session should contain the injected warning message
+    const msgs = yield* sessions.messages({ sessionID: chat.id })
+    const warning = msgs.find(
+      (msg) =>
+        msg.info.role === "user" &&
+        msg.parts.some(
+          (p) => p.type === "text" && p.synthetic && (p as SessionV1.TextPart).text.includes("Auto-detection warning"),
+        ),
+    )
+    expect(warning).toBeDefined()
+  }),
+)
+
+it.instance("completion marker: retries when response is interrupted (finish=unknown)", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "UnknownFinish",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    // First response: finish=unknown — should trigger warning + retry
+    yield* llm.push(reply().text("partial response").unknown())
+    // Second response: finish=stop — should be accepted (no marker enforcement without opt-in)
+    yield* llm.text("complete response")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    // Should have made 2 LLM calls
+    expect(yield* llm.hits).toHaveLength(2)
+
+    // Final response text should not contain marker
+    const parts = result.parts.filter((p) => p.type === "text")
+    const fullText = parts.map((p) => p.text).join("")
+    expect(fullText).not.toContain(MARKER)
+    expect(fullText).toBe("complete response")
+
+    // Session should contain the injected warning message
+    const msgs = yield* sessions.messages({ sessionID: chat.id })
+    const warning = msgs.find(
+      (msg) =>
+        msg.info.role === "user" &&
+        msg.parts.some(
+          (p) => p.type === "text" && p.synthetic && (p as SessionV1.TextPart).text.includes("Auto-detection warning"),
+        ),
+    )
+    expect(warning).toBeDefined()
+  }),
+)
+
+it.instance("retries when finish=stop but response has reasoning with no text or tool calls", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({
+      title: "ReasoningStop",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "hello" }],
+    })
+    // First response: reasoning-only with finish=stop — should trigger retry
+    yield* llm.push(reply().reason("I should check the task status").stop())
+    // Second response: finish tool-calls — should continue normally
+    yield* llm.text("complete response")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    // Should have made 2 LLM calls (retry happened)
+    expect(yield* llm.hits).toHaveLength(2)
+
+    // Final response text should be the second response
+    const parts = result.parts.filter((p) => p.type === "text")
+    const fullText = parts.map((p) => p.text).join("")
+    expect(fullText).toBe("complete response")
+
+    // Session should contain the injected warning message
+    const msgs = yield* sessions.messages({ sessionID: chat.id })
+    const warning = msgs.find(
+      (msg) =>
+        msg.info.role === "user" &&
+        msg.parts.some(
+          (p) =>
+            p.type === "text" &&
+            p.synthetic &&
+            (p as SessionV1.TextPart).text.includes("stopped while still in reasoning"),
+        ),
+    )
+    expect(warning).toBeDefined()
+  }),
+)
+
+// /cycle command
+
+noLLMServer.instance(
+  "/cycle start returns cycle started message",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: 'start 5m',
+      })
+      expect(result.info.role).toBe("user")
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("Cycle started: every 5m")
+      yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+    }),
+  { config: cfg },
+)
+
+it.instance(
+  "/cycle coalesces ticks while a round is running",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 50
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        const gate = yield* Deferred.make<void>()
+        yield* llm.hold("first", deferredAsPromise(gate))
+        yield* llm.text("second")
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: '100ms --replace',
+        })
+        yield* llm.wait(1)
+        yield* Effect.sleep(Duration.millis(350))
+        yield* Deferred.succeed(gate, void 0)
+        yield* llm.wait(2)
+        const callsAfterSecond = yield* llm.calls
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+        expect(callsAfterSecond).toBe(2)
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+noLLMServer.instance(
+  "/cycle refuses accidental replacement and accepts --replace",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: 'start 5m',
+      })
+      const refused = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: 'start 10m',
+      })
+      expect((refused.parts.find((part) => part.type === "text") as SessionV1.TextPart)?.text).toContain(
+        "already active",
+      )
+      const replaced = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: 'start 10m --replace',
+      })
+      expect((replaced.parts.find((part) => part.type === "text") as SessionV1.TextPart)?.text).toContain(
+        "Cycle started: every 10m",
+      )
+      yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle status shows active cycle",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: 'start 10m',
+      })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "status",
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("Cycle active: every 10m")
+      yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle state is isolated by session",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const first = yield* sessions.create({ title: "First Cycle" })
+      const second = yield* sessions.create({ title: "Second Cycle" })
+      yield* prompt.command({
+        sessionID: first.id,
+        command: "cycle",
+        arguments: 'start 5m',
+      })
+      yield* prompt.command({
+        sessionID: second.id,
+        command: "cycle",
+        arguments: 'start 10m',
+      })
+      yield* prompt.command({ sessionID: first.id, command: "cycle", arguments: "stop" })
+      const storage = yield* Storage.Service
+      expect((yield* Loop.readPersistedState(storage, first.id)).type).toBe("missing")
+      expect((yield* Loop.readPersistedState(storage, second.id)).type).toBe("found")
+      const status = yield* prompt.command({ sessionID: second.id, command: "cycle", arguments: "status" })
+      expect((status.parts.find((part) => part.type === "text") as SessionV1.TextPart)?.text).toContain("Cycle active")
+      yield* prompt.command({ sessionID: second.id, command: "cycle", arguments: "stop" })
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle stop returns rounds count",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: 'start 5m',
+      })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "stop",
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("Cycle stopped")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle stop with no active cycle returns message",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "stop",
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("No active cycle")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle status with no active cycle returns message",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "status",
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("No active cycle")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle start with missing interval returns usage",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "start",
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("Usage: /cycle")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle start with invalid interval returns error",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: 'start invalid',
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("Invalid interval")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle start with no prompt starts a bare cycle",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "start 5m",
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("Cycle started")
+      yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle start rejects interval below minimum",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: 'start 5s',
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("Minimum interval is 30s")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle with no arguments shows full help",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "",
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("Usage: /cycle")
+      expect((text as SessionV1.TextPart)?.text).toContain("Subcommands:")
+      expect((text as SessionV1.TextPart)?.text).toContain("start")
+      expect((text as SessionV1.TextPart)?.text).toContain("stop")
+      expect((text as SessionV1.TextPart)?.text).toContain("pause")
+      expect((text as SessionV1.TextPart)?.text).toContain("resume")
+      expect((text as SessionV1.TextPart)?.text).toContain("status")
+      expect((text as SessionV1.TextPart)?.text).toContain("Examples:")
+      expect((text as SessionV1.TextPart)?.text).toContain("Intervals:")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle help shows full help",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "help",
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("Usage: /cycle")
+      expect((text as SessionV1.TextPart)?.text).toContain("Examples:")
+    }),
+  { config: cfg },
+)
+
+it.instance(
+  "/cycle start sends prompts at intervals",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("done")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+
+        yield* llm.wait(3)
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+
+        expect(yield* llm.calls).toBeGreaterThanOrEqual(3)
+
+        const inputs = yield* llm.inputs
+        const lastInput = inputs.at(-1)
+        expect(JSON.stringify(lastInput)).toContain("[Cycle #")
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle first execution runs immediately",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("done")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 500ms',
+        })
+
+        yield* llm.wait(1)
+        expect(yield* llm.calls).toBe(1)
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+
+        expect(yield* llm.calls).toBeGreaterThanOrEqual(1)
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+noLLMServer.instance(
+  "/cycle pause and resume preserve round count",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: 'start 5m',
+      })
+
+      const pauseResult = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "pause",
+      })
+      const pauseText = pauseResult.parts.find((p) => p.type === "text")
+      expect((pauseText as SessionV1.TextPart)?.text).toContain("Cycle paused")
+
+      const statusResult = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "status",
+      })
+      const statusText = statusResult.parts.find((p) => p.type === "text")
+      expect((statusText as SessionV1.TextPart)?.text).toContain("paused")
+
+      const resumeResult = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "resume",
+      })
+      const resumeText = resumeResult.parts.find((p) => p.type === "text")
+      expect((resumeText as SessionV1.TextPart)?.text).toContain("Cycle resumed")
+
+      yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle pause with no active cycle returns message",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "pause",
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("No active cycle")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle resume with no active cycle returns message",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "resume",
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("No active cycle")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle pause twice returns already paused",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: 'start 5m',
+      })
+      yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "pause" })
+      const result = yield* prompt.command({
+        sessionID: chat.id,
+        command: "cycle",
+        arguments: "pause",
+      })
+      const text = result.parts.find((p) => p.type === "text")
+      expect((text as SessionV1.TextPart)?.text).toContain("already paused")
+      yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+    }),
+  { config: cfg },
+)
+
+
+
+it.instance(
+  "/cycle auto-stops after max consecutive failures",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalMax = loopConfig.maxConsecutiveFailures
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxConsecutiveFailures = 3
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.fail("boom")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+
+        yield* llm.wait(3)
+
+        expect(yield* llm.calls).toBeGreaterThanOrEqual(3)
+
+        const inputs = yield* llm.inputs
+        const lastInput = inputs.at(-1)
+        expect(JSON.stringify(lastInput)).toContain("[Cycle #")
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        loopConfig.maxConsecutiveFailures = originalMax
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle pauses after max dry iterations and status shows idle retries",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalMaxDry = loopConfig.maxDryIterations
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxDryIterations = 2
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("no file changes here")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+
+        yield* llm.wait(2)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            return stateMap[chat.id]?.paused ? (true as const) : undefined
+          }),
+          "loop never paused after dry iterations",
+          "10 seconds",
+        )
+
+        const statusResult = yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: "status",
+        })
+        const statusText = (statusResult.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+        expect(statusText).toContain("paused after 2 idle retries")
+
+        const stateMap = yield* prompt.loopState()
+        const state = stateMap[chat.id]
+        expect(state.paused).toBe(true)
+        expect(state.consecutiveDry).toBe(2)
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        loopConfig.maxDryIterations = originalMaxDry
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "recovered loop rounds run with the session instance context",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { chat } = yield* boot()
+      const storage = yield* Storage.Service
+      const database = yield* Database.Service
+      yield* llm.text("recovered round")
+      const now = Date.now()
+      yield* Loop.persistLoopState(storage, chat.id, {
+        version: 1,
+        intervalStr: "every 100ms",
+        schedule: { type: "cycle", intervalMs: 100 },
+        rounds: 4,
+        startedAt: now - 120_000,
+        nextRunAt: now - 1_000,
+        paused: false,
+        pending: false,
+        running: false,
+        consecutiveFailures: 0,
+        consecutiveDry: 0,
+        coalescedCount: 0,
+        timezone: "local",
+      })
+      // Simulate a server restart: rebuild the prompt graph with a fresh memo
+      // map so recovery runs again at layer init, sharing only this test's
+      // database (a fully isolated :memory: build would not see the session).
+      // Without the instance context on the recovered fiber, the round dies in
+      // Agent.defaultInfo ("InstanceRef not provided") before any LLM call.
+      const inner = LayerNode.compile(promptRoot, [
+        [SessionSummary.node, summary],
+        [LSP.node, lsp],
+        [MCP.node, makeMcp()],
+        [RuntimeFlags.node, runtimeFlags],
+        [InstanceStore.node, instanceStoreStub],
+        [Database.node, Layer.succeed(Database.Service, database)],
+      ])
+      const memo = yield* Layer.makeMemoMap
+      const scope = yield* Scope.make()
+      yield* Effect.gen(function* () {
+        yield* Layer.buildWithMemoMap(inner, memo, scope)
+        yield* llm.wait(1)
+      }).pipe(
+        // Server startup runs recovery with no ambient instance; mask the test
+        // body's InstanceRef so a missing provide in recovery is observable.
+        Effect.provideService(InstanceRef, undefined),
+        Effect.ensuring(Scope.close(scope, Exit.void)),
+        Effect.ensuring(Loop.clearPersistedState(storage, chat.id).pipe(Effect.ignore)),
+      )
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle status shows consecutive dry count before pause",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalMaxDry = loopConfig.maxDryIterations
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxDryIterations = 5
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("no file changes")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+
+        yield* llm.wait(1)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            return stateMap[chat.id]?.consecutiveDry === 1 ? (true as const) : undefined
+          }),
+          "loop never recorded first dry iteration",
+          "10 seconds",
+        )
+
+        const statusResult = yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: "status",
+        })
+        const statusText = (statusResult.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+        expect(statusText).toContain("1/5 consecutive idle iterations")
+
+        const stateMap = yield* prompt.loopState()
+        const state = stateMap[chat.id]
+        expect(state.consecutiveDry).toBe(1)
+        expect(state.paused).toBe(false)
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        loopConfig.maxDryIterations = originalMaxDry
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle does not count apply_patch rounds as dry",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        // apply_patch is only registered for gpt-* models (edit/write are
+        // disabled for those), so this test needs a gpt-* model config.
+        const patchCfg = (url: string) => ({
+          ...providerCfg(url),
+          provider: {
+            ...cfg.provider,
+            test: {
+              ...cfg.provider.test,
+              options: { ...cfg.provider.test.options, baseURL: url },
+              models: {
+                "gpt-5": { ...cfg.provider.test.models["test-model"], id: "gpt-5", name: "GPT-5" },
+              },
+            },
+          },
+          model: "test/gpt-5",
+        })
+        const { llm } = yield* useServerConfig(patchCfg)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({
+          title: "apply_patch cycle",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+        yield* llm.tool("apply_patch", {
+          patchText: "*** Begin Patch\n*** Add File: note.txt\n+hello\n*** End Patch",
+        })
+        yield* llm.text("added")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            const state = stateMap[chat.id]
+            return state && state.rounds >= 2 ? (true as const) : undefined
+          }),
+          "cycle never completed two rounds",
+          "10 seconds",
+        )
+
+        // Round 1 modified a file via apply_patch (dry resets), round 2 got the
+        // auto "ok" response with no tools (dry increments to exactly 1).
+        const dry = (yield* prompt.loopState())[chat.id].consecutiveDry
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+        expect(dry).toBe(1)
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle ticks while paused do not inflate coalesced count",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("ok")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            const state = stateMap[chat.id]
+            return state && state.rounds >= 1 ? (true as const) : undefined
+          }),
+          "cycle never completed a round",
+          "10 seconds",
+        )
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "pause" })
+        const coalesced = (yield* prompt.loopState())[chat.id].coalescedCount
+        // The sleep is the test: several scheduled ticks pass while paused and
+        // must not be counted as coalesced.
+        yield* Effect.sleep(Duration.millis(550))
+
+        expect((yield* prompt.loopState())[chat.id].coalescedCount).toBe(coalesced)
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle run while paused says to resume first",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("ok")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            const state = stateMap[chat.id]
+            return state && state.rounds >= 1 ? (true as const) : undefined
+          }),
+          "cycle never completed a round",
+          "10 seconds",
+        )
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "pause" })
+
+        const runResult = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "run" })
+        const runText = (runResult.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+        expect(runText).toContain("Cycle is paused")
+
+        const resumeResult = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "resume" })
+        const resumeText = (resumeResult.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+        expect(resumeText).toContain("Cycle resumed; a run is starting now.")
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle runs rounds on an idle-anchored interval",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("no file changes")
+
+        const started = yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+        const startedText = (started.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+        expect(startedText).toContain("Cycle started: every 200ms")
+
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            const state = stateMap[chat.id]
+            return state && state.rounds >= 2 ? (true as const) : undefined
+          }),
+          "cycle never completed two rounds",
+          "10 seconds",
+        )
+
+        const stateMap = yield* prompt.loopState()
+        expect(stateMap[chat.id].mode).toBe("cycle")
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle defers while the session is busy and does not coalesce ticks",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+
+        const gate = yield* Deferred.make<void>()
+        yield* llm.hold("user work", deferredAsPromise(gate))
+        const userRun = yield* prompt
+          .prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "work" }] })
+          .pipe(Effect.forkChild)
+        yield* waitForBusy(chat.id)
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: '300ms' })
+        // The sleep is the test: the first tick passes while the session is
+        // busy and must defer without counting as coalesced.
+        yield* Effect.sleep(Duration.millis(450))
+        const during = (yield* prompt.loopState())[chat.id]
+        expect(during.rounds).toBe(0)
+        expect(during.coalescedCount).toBe(0)
+
+        yield* Deferred.succeed(gate, void 0)
+        yield* Fiber.await(userRun)
+
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            const state = stateMap[chat.id]
+            return state && state.rounds >= 1 ? (true as const) : undefined
+          }),
+          "cycle never ran after the session went idle",
+          "10 seconds",
+        )
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle pauses when the user aborts a round",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+
+        const started = yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+        const startedText = (started.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+        expect(startedText).toContain("Cycle started: every 200ms")
+
+        // Hold the first round's LLM response so the abort lands mid-round.
+        const gate = yield* Deferred.make<void>()
+        yield* llm.hold("held round", deferredAsPromise(gate))
+        yield* waitForBusy(chat.id)
+        yield* prompt.cancel(chat.id)
+
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const state = (yield* prompt.loopState())[chat.id]
+            return state && state.rounds >= 1 && state.paused ? (true as const) : undefined
+          }),
+          "cycle never paused after the aborted round",
+          "10 seconds",
+        )
+
+        // The abort is a skip, not a failure, and no further rounds fire while paused.
+        yield* Deferred.succeed(gate, void 0)
+        yield* Effect.sleep(Duration.millis(500))
+        const during = (yield* prompt.loopState())[chat.id]
+        expect(during.rounds).toBe(1)
+        expect(during.consecutiveFailures).toBe(0)
+
+        yield* llm.text("resumed round")
+        const resumed = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "resume" })
+        const resumedText = (resumed.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+        expect(resumedText).toContain("Cycle resumed; a run is starting now.")
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const state = (yield* prompt.loopState())[chat.id]
+            return state && state.rounds >= 2 ? (true as const) : undefined
+          }),
+          "cycle never ran after resume",
+          "10 seconds",
+        )
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle refuses accidental replacement without --replace",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, chat } = yield* boot()
+      yield* llm.text("ok")
+
+      yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: 'start 5m' })
+
+      const conflict = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: 'start 3m' })
+      const conflictText = (conflict.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+      expect(conflictText).toContain("A cycle is already active")
+
+      const replaced = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: 'start 3m --replace' })
+      const replacedText = (replaced.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+      expect(replacedText).toContain("Cycle started: every 3m")
+      expect((yield* prompt.loopState())[chat.id].mode).toBe("cycle")
+
+      yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      expect((yield* prompt.loopState())[chat.id]).toBeUndefined()
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle pause, status, run, and resume round-trip",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalMaxDry = loopConfig.maxDryIterations
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxDryIterations = 10
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("no file changes")
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: '200ms' })
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            const state = stateMap[chat.id]
+            return state && state.rounds >= 1 ? (true as const) : undefined
+          }),
+          "cycle never completed a round",
+          "10 seconds",
+        )
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "pause" })
+
+        const status = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "status" })
+        const statusText = (status.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+        expect(statusText).toContain("Cycle active: every 200ms (paused)")
+
+        const run = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "run" })
+        const runText = (run.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+        expect(runText).toContain("Cycle is paused")
+
+        const before = (yield* prompt.loopState())[chat.id].rounds
+        const resume = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "resume" })
+        const resumeText = (resume.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+        expect(resumeText).toContain("Cycle resumed; a run is starting now.")
+
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            const state = stateMap[chat.id]
+            return state && state.rounds > before ? (true as const) : undefined
+          }),
+          "cycle never ran after resume",
+          "10 seconds",
+        )
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        loopConfig.maxDryIterations = originalMaxDry
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle pauses after max dry iterations",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalMaxDry = loopConfig.maxDryIterations
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxDryIterations = 2
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("no file changes")
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: '200ms' })
+
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            return stateMap[chat.id]?.paused ? (true as const) : undefined
+          }),
+          "cycle never paused after dry iterations",
+          "10 seconds",
+        )
+
+        const state = (yield* prompt.loopState())[chat.id]
+        expect(state.consecutiveDry).toBe(2)
+        expect(state.mode).toBe("cycle")
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        loopConfig.maxDryIterations = originalMaxDry
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle rejects clock-time schedules",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, chat } = yield* boot()
+      yield* llm.text("ok")
+
+      const at = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: 'at 14:00' })
+      const atText = (at.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+      expect(atText).toContain("Cycles only support intervals")
+
+      const startAt = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: 'start at 14:00' })
+      const startAtText = (startAt.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+      expect(startAtText).toContain("Cycles only support intervals")
+
+      expect((yield* prompt.loopState())[chat.id]).toBeUndefined()
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle skip on busy does not send messages to transcript",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.hang
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+
+        yield* llm.wait(1)
+        yield* Effect.sleep(Duration.millis(500))
+
+        const messages = yield* (yield* Session.Service).messages({ sessionID: chat.id, limit: 100 })
+        const skipMessages = messages.filter(
+          (m) => m.info.role === "user" && m.parts.some((p) => p.type === "text" && p.text.includes("Skipped")),
+        )
+        expect(skipMessages.length).toBe(0)
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+
+
+it.instance(
+  "/cycle --replace keeps cycle alive after first scheduled run",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("done")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+        yield* llm.wait(1)
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: '200ms --replace',
+        })
+
+        yield* llm.wait(3)
+
+        const stateMap = yield* prompt.loopState()
+        expect(stateMap[chat.id]).toBeDefined()
+        expect(stateMap[chat.id].paused).toBe(false)
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle resume keeps cycle alive after next scheduled run",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalMaxDry = loopConfig.maxDryIterations
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxDryIterations = 2
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("no file changes")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+
+        yield* llm.wait(2)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const s = yield* prompt.loopState()
+            return s[chat.id]?.paused ? (true as const) : undefined
+          }),
+          "cycle never paused",
+          "10 seconds",
+        )
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: "resume",
+        })
+
+        yield* llm.wait(3)
+
+        const stateMap = yield* prompt.loopState()
+        expect(stateMap[chat.id]).toBeDefined()
+        expect(stateMap[chat.id].paused).toBe(false)
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "persisted cycle state decodes with defaults for fields added later",
+  () =>
+    Effect.gen(function* () {
+      const storage = yield* Storage.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "recover" })
+      const now = Date.now()
+      // consecutiveDry deliberately omitted: persisted states written before
+      // the field existed must decode through the withDecodingDefaultKey(0)
+      // fallback instead of being discarded as invalid.
+      yield* storage
+        .write(["loop", chat.id, "state"], {
+          version: 1,
+          intervalStr: "every 5m",
+          schedule: { type: "cycle", intervalMs: 300_000 },
+          rounds: 7,
+          startedAt: now - 60_000,
+          nextRunAt: now + 300_000,
+          paused: false,
+          pending: false,
+          running: false,
+          consecutiveFailures: 0,
+          coalescedCount: 0,
+          timezone: "local",
+        })
+        .pipe(Effect.orDie)
+
+      const recovered = yield* Loop.readPersistedState(storage, chat.id)
+      expect(recovered.type).toBe("found")
+      if (recovered.type !== "found") return
+      expect(recovered.state.consecutiveDry).toBe(0)
+      expect(recovered.state.rounds).toBe(7)
+      expect(Loop.scheduleMode()).toBe("cycle")
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle user abort pauses the cycle without counting a failure",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalMaxDry = loopConfig.maxDryIterations
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxDryIterations = 10
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("first ok")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 500ms',
+        })
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            const state = stateMap[chat.id]
+            return state && state.rounds >= 1 ? (true as const) : undefined
+          }),
+          "cycle never completed its first round",
+          "10 seconds",
+        )
+
+        // Round 2 hangs mid-stream and gets aborted by the user; the cycle must
+        // pause instead of firing round 3. llm.wait(2) proves round 2's request
+        // actually consumed the hung response before we abort — cancelling on
+        // waitForBusy alone races the request and would leave the hang queued
+        // for the next round to consume.
+        yield* llm.hang
+        yield* llm.wait(2)
+        yield* prompt.cancel(chat.id)
+
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            const state = stateMap[chat.id]
+            return state && state.rounds >= 2 && state.paused ? (true as const) : undefined
+          }),
+          "cycle never paused after the aborted round",
+          "15 seconds",
+        )
+
+        const state = (yield* prompt.loopState())[chat.id]
+        expect(state.consecutiveFailures).toBe(0)
+
+        const texts = (yield* MessageV2.filterCompactedEffect(chat.id))
+          .flatMap((msg) => msg.parts)
+          .filter((part) => part.type === "text")
+          .map((part) => part.text)
+        expect(texts.some((text) => text.includes("Iteration failed"))).toBe(false)
+
+        // Resume fires the next round immediately.
+        yield* llm.text("after resume")
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "resume" })
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            const state = stateMap[chat.id]
+            return state && state.rounds >= 3 ? (true as const) : undefined
+          }),
+          "cycle never continued after resume",
+          "15 seconds",
+        )
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        loopConfig.maxDryIterations = originalMaxDry
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle stops when its session is deleted",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat, sessions } = yield* boot()
+        yield* llm.text("ok")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            const state = stateMap[chat.id]
+            return state && state.rounds >= 1 ? (true as const) : undefined
+          }),
+          "cycle never completed a round",
+          "10 seconds",
+        )
+
+        yield* sessions.remove(chat.id)
+
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            return stateMap[chat.id] === undefined ? (true as const) : undefined
+          }),
+          "cycle never stopped after its session was deleted",
+          "10 seconds",
+        )
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle --replace with failing LLM does not cancel cycle",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalMaxFailures = loopConfig.maxConsecutiveFailures
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxConsecutiveFailures = 10
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("first ok")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+        yield* llm.wait(1)
+
+        yield* llm.fail("boom")
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: '200ms --replace',
+        })
+
+        yield* llm.wait(2)
+
+        const stateMap = yield* prompt.loopState()
+        expect(stateMap[chat.id]).toBeDefined()
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        loopConfig.maxConsecutiveFailures = originalMaxFailures
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle --replace while old round is running does not cancel new cycle",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+
+        const gate = yield* Deferred.make<void>()
+        yield* llm.hold("first", deferredAsPromise(gate))
+        yield* llm.text("second")
+        yield* llm.text("third")
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: 'start 200ms',
+        })
+        yield* llm.wait(1)
+
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: '200ms --replace',
+        })
+
+        yield* Deferred.succeed(gate, void 0)
+
+        yield* llm.wait(3)
+
+        const stateMap = yield* prompt.loopState()
+        expect(stateMap[chat.id]).toBeDefined()
+        expect(stateMap[chat.id].paused).toBe(false)
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
   30_000,
 )
