@@ -1321,12 +1321,6 @@ const layer = Layer.effect(
                 ...(mcpInstructions ? [mcpInstructions] : []),
                 ...(skills ? [skills] : []),
               ]
-              const cfg = yield* config.get()
-              if (cfg.task_model) {
-                system.push(
-                  "Task model selection is enabled. Distribute load across multiple models by launching subagents concurrently. For each task, specify model_level (1-3) based on task difficulty: 1 = cheapest (small tasks, simple lookups), 2 = everyday (routine work), 3 = best (large-scale or difficult tasks).",
-                )
-              }
               const format = lastUser.format ?? { type: "text" as const }
               if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
               const enforceMarker =

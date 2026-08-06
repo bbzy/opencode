@@ -2038,7 +2038,7 @@ export type Config = {
     max_lines?: number
     max_bytes?: number
   }
-  task_model?: boolean
+  image_models?: Array<string>
   compaction?: {
     auto?: boolean
     prune?: boolean

@@ -146,9 +146,9 @@ export const Info = Schema.Struct({
     description:
       "Thresholds for truncating tool output. When output exceeds either limit, the full text is written to the truncation directory and a preview is returned.",
   }),
-  task_model: Schema.optional(Schema.Boolean).annotate({
+  image_models: Schema.optional(Schema.Array(Schema.String)).annotate({
     description:
-      "Enable task model selection for subagents. When true, the task tool accepts model and model_level parameters, and reads task_model.json from the config directory. Defaults to false.",
+      'List of "provider/model" pairs used by the view_image tool to analyze images. The model part may contain slashes. Entries are tried in order against connected providers; the first that resolves is called directly via its provider API, without injecting any prompt. Defaults to empty (view_image is unavailable).',
   }),
   compaction: Schema.optional(
     Schema.Struct({

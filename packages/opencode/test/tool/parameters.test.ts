@@ -22,6 +22,7 @@ import { Parameters as Shell } from "../../src/tool/shell"
 import { Parameters as Skill } from "../../src/tool/skill"
 import { Parameters as Task } from "../../src/tool/task"
 import { Parameters as Todo } from "../../src/tool/todo"
+import { Parameters as ViewImage } from "../../src/tool/view-image"
 import { Parameters as WebFetch } from "../../src/tool/webfetch"
 import { Parameters as WebSearch } from "../../src/tool/websearch"
 import { Parameters as Write } from "../../src/tool/write"
@@ -49,6 +50,7 @@ describe("tool parameters", () => {
     test("skill", () => expect(toJsonSchema(Skill)).toMatchSnapshot())
     test("task", () => expect(toJsonSchema(Task)).toMatchSnapshot())
     test("todo", () => expect(toJsonSchema(Todo)).toMatchSnapshot())
+    test("view_image", () => expect(toJsonSchema(ViewImage)).toMatchSnapshot())
     test("webfetch", () => expect(toJsonSchema(WebFetch)).toMatchSnapshot())
     test("websearch", () => expect(toJsonSchema(WebSearch)).toMatchSnapshot())
     test("write", () => expect(toJsonSchema(Write)).toMatchSnapshot())
@@ -257,6 +259,21 @@ describe("tool parameters", () => {
     })
     test("rejects missing todos", () => {
       expect(accepts(Todo, {})).toBe(false)
+    })
+  })
+
+  describe("view_image", () => {
+    test("accepts filePath + prompt", () => {
+      const parsed = parse(ViewImage, { filePath: "/tmp/a.png", prompt: "What color is the button?" })
+      expect(parsed.filePath).toBe("/tmp/a.png")
+      expect(parsed.prompt).toBe("What color is the button?")
+    })
+    test("accepts filePath only", () => {
+      const parsed = parse(ViewImage, { filePath: "/tmp/a.png" })
+      expect(parsed.prompt).toBeUndefined()
+    })
+    test("rejects missing filePath", () => {
+      expect(accepts(ViewImage, {})).toBe(false)
     })
   })
 

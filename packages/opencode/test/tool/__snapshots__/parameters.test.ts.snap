@@ -317,10 +317,6 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
       "description": "Model to use for this subagent, in the format "provider/model_name" (e.g. anthropic/claude-sonnet-4). Overrides the default model selection.",
       "type": "string",
     },
-    "model_level": {
-      "description": "Model level (1-3) for auto-selection from task_model.json. 1=cheapest, 2=everyday, 3=very difficult. The system randomly selects a model of the requested level. Only works when task_model.json is configured.",
-      "type": "number",
-    },
     "prompt": {
       "description": "The task for the agent to perform",
       "type": "string",
@@ -376,6 +372,26 @@ exports[`tool parameters JSON Schema (wire shape) todo 1`] = `
   },
   "required": [
     "todos",
+  ],
+  "type": "object",
+}
+`;
+
+exports[`tool parameters JSON Schema (wire shape) view_image 1`] = `
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "filePath": {
+      "description": "The absolute path to the image file to analyze",
+      "type": "string",
+    },
+    "prompt": {
+      "description": "What to ask about the image. When omitted, the vision model returns a detailed description.",
+      "type": "string",
+    },
+  },
+  "required": [
+    "filePath",
   ],
   "type": "object",
 }

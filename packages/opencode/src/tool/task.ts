@@ -15,8 +15,6 @@ import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
 import { Provider } from "@/provider/provider"
-import { ConfigTaskModel } from "@/config/task-model"
-import { TaskModel } from "@/task-model"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -42,7 +40,6 @@ const BACKGROUND_UPDATED = [
   "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.",
   "Work on non-overlapping tasks, or briefly tell the user what you sent and end your response.",
 ].join("\n")
-
 const CoreParameterFields = {
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
   prompt: Schema.String.annotate({ description: "The task for the agent to perform" }),
@@ -59,10 +56,6 @@ const ModelParameterFields = {
     description:
       'Model to use for this subagent, in the format "provider/model_name" (e.g. anthropic/claude-sonnet-4). Overrides the default model selection.',
   }),
-  model_level: Schema.optional(Schema.Number).annotate({
-    description:
-      "Model level (1-3) for auto-selection from task_model.json. 1=cheapest, 2=everyday, 3=very difficult. The system randomly selects a model of the requested level. Only works when task_model.json is configured.",
-  }),
 }
 
 const BackgroundField = {
@@ -72,31 +65,12 @@ const BackgroundField = {
   }),
 }
 
-const RequiredModelParameterFields = {
-  model: Schema.optional(Schema.String).annotate({
-    description:
-      'Model to use for this subagent, in the format "provider/model_name" (e.g. anthropic/claude-sonnet-4). Overrides the default model selection.',
-  }),
-  model_level: Schema.Number.annotate({
-    description:
-      "Model level (1-3) for auto-selection from task_model.json. 1=cheapest, 2=everyday, 3=very difficult. The system randomly selects a model of the requested level. Only works when task_model.json is configured.",
-  }),
-}
-
 const CoreParameters = Schema.Struct(CoreParameterFields)
-export const ParametersWithoutModel = CoreParameters
-export const ParametersWithoutModelWithBackground = Schema.Struct({ ...CoreParameterFields, ...BackgroundField })
 const BaseParameters = Schema.Struct({ ...CoreParameterFields, ...ModelParameterFields })
 
 export const Parameters = Schema.Struct({
   ...CoreParameterFields,
   ...ModelParameterFields,
-  ...BackgroundField,
-})
-
-export const ParametersWithModel = Schema.Struct({
-  ...CoreParameterFields,
-  ...RequiredModelParameterFields,
   ...BackgroundField,
 })
 
@@ -139,13 +113,6 @@ export const TaskTool = Tool.define(
           new Error("Background subagents require OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true"),
         )
       }
-      if (cfg.task_model && !params.model && params.model_level == null) {
-        return yield* new Tool.InvalidArgumentsError({
-          tool: id,
-          detail: "task_model is enabled — you must specify either model or model_level",
-        })
-      }
-
       const parent = yield* sessions.get(ctx.sessionID)
       let current = parent
       let depth = 0
@@ -223,38 +190,19 @@ export const TaskTool = Tool.define(
       if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
       const variant = msg.info.variant
 
-      const taskModelConfig = cfg.task_model
-        ? yield* ConfigTaskModel.load().pipe(
-            Effect.catch((err) =>
-              Effect.gen(function* () {
-                yield* Effect.logError("task_model.json load failed", { error: String(err) })
-                return undefined
-              }),
-            ),
-          )
-        : undefined
-
       let model: { modelID: typeof msg.info.modelID; providerID: typeof msg.info.providerID }
       let useOwnVariant: boolean
 
       if (params.model) {
         model = Provider.parseModel(params.model)
         useOwnVariant = true
-      } else if (params.model_level != null && taskModelConfig) {
-        const selected = TaskModel.selectModel(taskModelConfig, params.model_level)
-        if (selected) {
-          model = Provider.parseModel(selected)
-          useOwnVariant = true
-        } else {
-          model = next.model ?? { modelID: msg.info.modelID, providerID: msg.info.providerID }
-          useOwnVariant = !!next.model
-        }
       } else {
         model = next.model ?? { modelID: msg.info.modelID, providerID: msg.info.providerID }
         useOwnVariant = !!next.model
       }
 
       const resolvedVariant = useOwnVariant ? undefined : variant
+
       const metadata = {
         parentSessionId: ctx.sessionID,
         sessionId: nextSession.id,
