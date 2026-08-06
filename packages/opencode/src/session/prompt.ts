@@ -1874,20 +1874,18 @@ mode: "cycle" as const,
       schedule: Loop.ScheduleInfo
       nextRunAt: number
       startedAt: number
-      replace: boolean
       announce?: boolean
       messageID?: MessageID
     }) {
       const existing = activeCycles.get(input.sessionID)
-      if (existing && !input.replace) {
-        return { text: `A cycle is already active for this session. Use /cycle stop first or request replacement.` }
-      }
       if (existing) {
+        // Overwrite policy: starting a new cycle always replaces the active one.
         yield* Fiber.interrupt(existing.fiber)
         yield* Loop.clearPersistedState(storage, input.sessionID)
       }
 
-      const text = `Cycle started: ${input.intervalStr}; first run ${new Date(input.nextRunAt).toTimeString().slice(0, 5)}; runs until stopped`
+      const replaced = existing ? "; replaced previous cycle" : ""
+      const text = `Cycle started: ${input.intervalStr}; first run ${new Date(input.nextRunAt).toTimeString().slice(0, 5)}; runs until stopped${replaced}`
       const message = input.announce ? yield* noReply(input.sessionID, input.messageID, text) : undefined
       const state = yield* startLoopFiber({
         sessionID: input.sessionID,
@@ -1910,7 +1908,7 @@ mode: "cycle" as const,
       const raw = input.arguments.match(argsRegex) ?? []
       const args = raw.map((arg) => arg.replace(quoteTrimRegex, ""))
       const subcommand = args[0]
-      const usageText = "Usage: /cycle [start] <interval> [--replace]"
+      const usageText = "Usage: /cycle [start] <interval>"
       const helpText = [
         usageText,
         "",
@@ -1923,8 +1921,8 @@ mode: "cycle" as const,
         "  status   Show the current cycle status",
         "",
         "Start syntax:",
-        "  /cycle [start] <interval> [--replace]",
-        "  Add --replace to replace the active cycle",
+        "  /cycle [start] <interval>",
+        "  Starting a new cycle replaces the active one.",
         "",
         `Minimum interval: ${Loop.loopConfig.minIntervalMs / 1000}s`,
         `Auto-stops after ${Loop.loopConfig.maxConsecutiveFailures} consecutive failures`,
@@ -1932,7 +1930,6 @@ mode: "cycle" as const,
         "",
         "Examples:",
         "  /cycle 5m",
-        "  /cycle 5m --replace",
         "  /cycle stop",
         "  /cycle pause",
         "  /cycle resume",
@@ -1985,13 +1982,8 @@ mode: "cycle" as const,
         intervalStr = `every ${intervalStrRaw}`
         nextRunAt = now + intervalMs
 
-        let replace = false
         for (let index = 1; index < values.length; index++) {
           const value = values[index]
-          if (value === "--replace") {
-            replace = true
-            continue
-          }
           return yield* noReply(input.sessionID, input.messageID, `Unexpected argument: "${value}".\n\n${usageText}`)
         }
 
@@ -2001,7 +1993,6 @@ mode: "cycle" as const,
           schedule,
           nextRunAt,
           startedAt: now,
-          replace,
           announce: true,
           messageID: input.messageID,
         })

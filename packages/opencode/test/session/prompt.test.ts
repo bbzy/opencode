@@ -2720,7 +2720,7 @@ it.instance(
         yield* prompt.command({
           sessionID: chat.id,
           command: "cycle",
-          arguments: '100ms --replace',
+          arguments: '100ms',
         })
         yield* llm.wait(1)
         yield* Effect.sleep(Duration.millis(350))
@@ -2738,7 +2738,7 @@ it.instance(
 )
 
 noLLMServer.instance(
-  "/cycle refuses accidental replacement and accepts --replace",
+  "/cycle replaces the active cycle when a new one is started",
   () =>
     Effect.gen(function* () {
       const prompt = yield* SessionPrompt.Service
@@ -2749,22 +2749,16 @@ noLLMServer.instance(
         command: "cycle",
         arguments: 'start 5m',
       })
-      const refused = yield* prompt.command({
+      const replaced = yield* prompt.command({
         sessionID: chat.id,
         command: "cycle",
         arguments: 'start 10m',
       })
-      expect((refused.parts.find((part) => part.type === "text") as SessionV1.TextPart)?.text).toContain(
-        "already active",
-      )
-      const replaced = yield* prompt.command({
-        sessionID: chat.id,
-        command: "cycle",
-        arguments: 'start 10m --replace',
-      })
-      expect((replaced.parts.find((part) => part.type === "text") as SessionV1.TextPart)?.text).toContain(
-        "Cycle started: every 10m",
-      )
+      const text = (replaced.parts.find((part) => part.type === "text") as SessionV1.TextPart)?.text ?? ""
+      expect(text).toContain("Cycle started: every 10m")
+      expect(text).toContain("replaced previous cycle")
+      const state = (yield* prompt.loopState())[chat.id]
+      expect(state.intervalStr).toBe("every 10m")
       yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
     }),
   { config: cfg },
@@ -3664,7 +3658,7 @@ it.instance(
 )
 
 it.instance(
-  "/cycle refuses accidental replacement without --replace",
+  "/cycle starting a new cycle overwrites the active one",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
@@ -3673,13 +3667,10 @@ it.instance(
 
       yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: 'start 5m' })
 
-      const conflict = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: 'start 3m' })
-      const conflictText = (conflict.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
-      expect(conflictText).toContain("A cycle is already active")
-
-      const replaced = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: 'start 3m --replace' })
+      const replaced = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: 'start 3m' })
       const replacedText = (replaced.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
       expect(replacedText).toContain("Cycle started: every 3m")
+      expect(replacedText).toContain("replaced previous cycle")
       expect((yield* prompt.loopState())[chat.id].mode).toBe("cycle")
 
       yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
@@ -3845,7 +3836,7 @@ it.instance(
 
 
 it.instance(
-  "/cycle --replace keeps cycle alive after first scheduled run",
+  "/cycle restart keeps cycle alive after first scheduled run",
   () =>
     Effect.gen(function* () {
       const originalMin = loopConfig.minIntervalMs
@@ -3865,7 +3856,7 @@ it.instance(
         yield* prompt.command({
           sessionID: chat.id,
           command: "cycle",
-          arguments: '200ms --replace',
+          arguments: '200ms',
         })
 
         yield* llm.wait(3)
@@ -4096,7 +4087,7 @@ it.instance(
 )
 
 it.instance(
-  "/cycle --replace with failing LLM does not cancel cycle",
+  "/cycle restart with failing LLM does not cancel cycle",
   () =>
     Effect.gen(function* () {
       const originalMin = loopConfig.minIntervalMs
@@ -4119,7 +4110,7 @@ it.instance(
         yield* prompt.command({
           sessionID: chat.id,
           command: "cycle",
-          arguments: '200ms --replace',
+          arguments: '200ms',
         })
 
         yield* llm.wait(2)
@@ -4138,7 +4129,7 @@ it.instance(
 )
 
 it.instance(
-  "/cycle --replace while old round is running does not cancel new cycle",
+  "/cycle restart while old round is running does not cancel new cycle",
   () =>
     Effect.gen(function* () {
       const originalMin = loopConfig.minIntervalMs
@@ -4162,7 +4153,7 @@ it.instance(
         yield* prompt.command({
           sessionID: chat.id,
           command: "cycle",
-          arguments: '200ms --replace',
+          arguments: '200ms',
         })
 
         yield* Deferred.succeed(gate, void 0)

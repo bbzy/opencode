@@ -16,7 +16,7 @@ Cycle-on-project mode is carried by opencode's built-in `/cycle` scheduler:
 
 - `/cycle <interval>` (e.g. `/cycle 3m`) starts the automation. You establish scope and baseline, then start working **in the current turn**.
 - After you finish a turn and go idle, the scheduler waits `<interval>` of idle time, then injects a round prompt — `[Cycle #N] Automated cycle — iteration N.` — as a new user message. That prompt is your wake-up call: continue the loop from session state.
-- `/loop` (wall-clock scheduling) is a sibling automation for timed tasks; it is NOT what drives this mode. Loop and cycle are mutually exclusive per session — if the user switches with `--replace`, follow whichever round prompts arrive.
+- `/loop` (wall-clock scheduling) is a sibling automation for timed tasks; it is NOT what drives this mode. Loop and cycle are mutually exclusive per session — starting a new automation replaces the active one, so follow whichever round prompts arrive.
 - Round cadence is idle-anchored: long-running turns are never interrupted by a round, and your own turns push the next wake out by the interval.
 
 **Terminology**: a **round** is one scheduler wake (one turn). A **cycle** is one full Do → Check → Reflect → Plan pass, which may span several rounds.
