@@ -11,16 +11,26 @@ try {
     cd $old_dir
 }
 
-if $nu.os-info.name == 'windows' {
-    cp packages/opencode/dist/opencode-windows-x64/bin/opencode.exe ~/.cargo/bin/
+let os = if $nu.os-info.name == 'windows' {
+    'windows'
+} else if $nu.os-info.name == 'macos' {
+    'darwin'
 } else {
-    let install_path = ($env.HOME + '/.opencode/bin/opencode')
-
-    if ($install_path | path exists) {
-        rm $install_path
-    }
-
-    ^./install -b packages/opencode/dist/opencode-darwin-arm64/bin/opencode
+    'linux'
 }
+
+let arch = if $nu.os-info.arch == 'aarch64' {
+    'arm64'
+} else {
+    'x64'
+}
+
+mut opencode_product_path = $'packages/opencode/dist/opencode-($os)-($arch)/bin/opencode'
+
+if $os == 'windows' {
+    $opencode_product_path += '.exe'
+}
+
+cp $opencode_product_path ~/.cargo/bin/
 
 print "Installed opencode"
