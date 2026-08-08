@@ -109,11 +109,30 @@ export function scheduleMode(): "cycle" {
 // Cycle prompts omit "Next:" deliberately: the next round starts <interval>
 // after this round *ends*, so any clock time shown here would be wrong for
 // rounds longer than the interval.
-export function buildCyclePrompt(round: number) {
+export function buildCyclePrompt(
+  round: number,
+  context?: {
+    consecutiveDry: number
+    previous?: { round: number; summary: string }
+  },
+) {
   const now = new Date()
   const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`
   const time = now.toTimeString().slice(0, 5)
-  return `[Cycle #${round}] Automated cycle — iteration ${round}. ${date} ${time}.`
+  const lines = [`[Cycle #${round}] Automated cycle — iteration ${round}. ${date} ${time}.`]
+  if (context?.previous) {
+    lines.push(`Last completed iteration: #${context.previous.round} — ${context.previous.summary}`)
+  }
+  if (context && context.consecutiveDry > 0) {
+    lines.push(
+      `Idle status: ${context.consecutiveDry}/${loopConfig.maxDryIterations} consecutive iterations without file modifications; the cycle auto-pauses at ${loopConfig.maxDryIterations}.`,
+    )
+  }
+  lines.push(
+    `If you already completed iteration ${round} or later, treat this as a duplicate delivery: confirm briefly without redoing work.`,
+  )
+  lines.push(`If no meaningful work remains, say DONE with a one-line reason instead of running status-check-only rounds.`)
+  return lines.join("\n")
 }
 
 function stateKey(sessionID: string) {
@@ -159,6 +178,20 @@ export function persistRoundResult(
     yield* Effect.forEach(entries.slice(0, -loopConfig.maxResults), (key) => storage.remove(key).pipe(Effect.ignore), {
       discard: true,
     })
+  })
+}
+
+// The previous round's response tail, folded into the next round prompt so
+// the model has cross-round continuity without re-deriving what just happened.
+export function latestRoundResult(storage: Storage.Interface, sessionID: string) {
+  return Effect.gen(function* () {
+    const entries = yield* storage.list(roundsKey(sessionID)).pipe(Effect.orElseSucceed(() => []))
+    const last = entries.at(-1)
+    if (!last) return undefined
+    const data = yield* storage.read<{ round: number; response?: string }>(last).pipe(Effect.orElseSucceed(() => undefined))
+    if (!data || typeof data.response !== "string" || data.response.trim() === "") return undefined
+    const summary = data.response.replace(/\s+/g, " ").trim().slice(-300)
+    return { round: data.round, summary }
   })
 }
 

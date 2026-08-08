@@ -18,6 +18,8 @@ Cycle-on-project mode is carried by opencode's built-in `/cycle` scheduler:
 - After you finish a turn and go idle, the scheduler waits `<interval>` of idle time, then injects a round prompt — `[Cycle #N] Automated cycle — iteration N.` — as a new user message. That prompt is your wake-up call: continue the loop from session state.
 - `/loop` (wall-clock scheduling) is a sibling automation for timed tasks; it is NOT what drives this mode. Loop and cycle are mutually exclusive per session — starting a new automation replaces the active one, so follow whichever round prompts arrive.
 - Round cadence is idle-anchored: long-running turns are never interrupted by a round, and your own turns push the next wake out by the interval.
+- Keep rounds small. Aim for one complete, verifiable unit per round (a fix + its check, a review pass + its conclusions), then end the turn with a brief report. A round that balloons for hours loses the scheduler's cadence, inflates the context, and is where loops and hallucinations creep in. If a task is too big for one round, land an incremental slice and queue the rest in the backlog.
+- Persist the backlog, don't memorize it. Keep the planned task backlog, current task, and pending decisions in the session's todo list (or a file in the repo for long horizons), refreshed at every phase transition — round prompts and compactions are lossy, and prose memory is the first thing to rot.
 
 **Terminology**: a **round** is one scheduler wake (one turn). A **cycle** is one full Do → Check → Reflect → Plan pass, which may span several rounds.
 
@@ -36,6 +38,9 @@ Think of yourself as a developer who has been assigned ownership of a specific a
 3. **Pick your own next task.** In the Plan phase, generate candidate tasks, evaluate their priority yourself, and start the highest-value one. Don't ask the user to choose between tasks. The user can always interrupt with a specific task (see Mid-Loop User Instructions) or stop the loop; you don't need to offer a menu to enable that.
 4. **Organize commits and commit automatically.** Group this cycle's related changes logically, write a clear commit message for each group, then commit with the detected VCS without asking for confirmation. Don't leave changes uncommitted at the end of a cycle. In a jj repo, also tidy the **entire current branch's commit history** — not just this cycle's changes — by splitting over-broad commits, squashing fragmented ones, reordering for logical flow, and rewording unclear messages; jj history is mutable by design.
 5. **Don't ask what you can look up.** Before asking the user anything, exhaust self-service channels: read the code, check config, run tests, inspect git history.
+6. **The session is unattended — never end a turn waiting for an answer.** Blocking questions ("which option should I pick?", "please confirm these 6 items") are never answered; they just stall the loop and get parroted round after round. Decide objective questions yourself. For genuinely subjective choices, pick a reasonable default, proceed, and note the decision in your report as something the user may want to revisit — that is information, not a question.
+7. **A fix is not done until it is verified.** Never commit or report a fix without running the strongest available check — full build, targeted test, or at minimum a syntax/type check of the touched files. If the project has no quick verification path, invest one round in creating one (a scratch syntax-check script is fine) before piling up unverified fixes.
+8. **Serialize VCS operations and edits.** jj snapshots the working copy on every command, so interleaving edits with jj/git commands on the same files produces lost changes, phantom conflicts, and history surgery. Finish the edits for a logical unit first, then run VCS commands one at a time and check `jj st` (or `git status`) after each before continuing. If the history does get tangled, stop editing and repair it before anything else.
 
 ## Entry — Establish Scope and Baseline
 
@@ -104,6 +109,12 @@ A round prompt (`[Cycle #N] Automated cycle — iteration N. ...`) is the schedu
 - If you were mid-task when the previous turn ended, finish it. Otherwise advance the phase machine (Do → Check → Reflect → Plan → Do).
 - If the conversation was compacted since the last round, reload this skill via the `skill` tool and reconstruct loop state from history before continuing.
 - Reply by doing the work, not by acknowledging the prompt (no "acknowledged, continuing" — just continue).
+
+Round prompts may carry extra context lines:
+
+- **Last completed iteration** — the tail of your own previous round report. Use it as ground truth for where the loop stands; do not re-verify work it says was done.
+- **Idle status** — how many consecutive rounds had no file modifications, and the auto-pause threshold. Rounds with no completed `edit`/`write`/`apply_patch` count as idle, and enough consecutive idle rounds auto-pause the cycle — so a round whose only output is status checks (`jj st`, `git status`, re-running a green build) burns the budget and brings the pause closer. If work is genuinely done, say DONE with a one-line reason instead of manufacturing status-check rounds; the user can stop the cycle, and honesty beats busy-work.
+- **Duplicate-delivery note** — the scheduler deduplicates rounds, but if a prompt names an iteration you already completed, treat it as a duplicate: confirm briefly and end the turn without redoing anything. Never invent your own iteration numbering — trust the `[Cycle #N]` in the prompt over your memory of "which cycle this is".
 
 ### Phase 1 — Do Tasks
 
@@ -216,7 +227,7 @@ When stopping:
 4. If the user said stop in chat but the scheduler may still be active, remind them once to run `/cycle stop` — otherwise round prompts will keep waking you. You cannot run it yourself.
 5. Exit loop mode.
 
-Never self-terminate. Even if you think there's "nothing left to do," the Plan phase should always propose something — there's always technical debt, always a test that could be more thorough, always documentation that could be clearer. If you genuinely can't think of anything valuable, propose "review the entire scope for any deterioration since the baseline" as a task.
+Never self-terminate. Even if you think there's "nothing left to do," the Plan phase should always propose something — there's always technical debt, always a test that could be more thorough, always documentation that could be clearer. But stay honest about value: if the scope is genuinely in good shape and the only "work" left is re-running green checks and re-reading clean diffs, report DONE with a one-line justification and end the turn. Idle status-check rounds count toward the scheduler's auto-pause threshold anyway, so an honest DONE is strictly better than manufactured busy-work — the loop stays alive for the user to redirect, and you lose nothing.
 
 ## Compaction Resilience
 

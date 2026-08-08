@@ -35,18 +35,20 @@
   - 跨进程命令回退：本进程无活跃 cycle 但 persisted state 存在时，`stop` 清除状态（owner 下一 tick 退出）、`pause`/`resume` 变更状态并 bump `commandSeq`、`status` 显示"in another process"
   - 测试：auto-pause 后不再有点火（回归）、跨进程接管租约后静默退出、跨进程 resume 下一 tick 被采纳、跨进程 stop/pause/resume/status 回退
 
-### Phase B — 提示词（P0，低成本高收益，紧跟 A 后做）
+### Phase B — 提示词（P0，低成本高收益，紧跟 A 后做）✅ 已完成（2026-08-08）
 
-- [ ] **B1. round prompt 富化**
-  - 位置：`loop.ts` `buildCyclePrompt`
-  - 内容增量：① 上轮产出摘要（1-2 行）；② 当前 `consecutiveDry/maxDryIterations` 状态与 dry 规则提醒；③ 去重指令（"若该轮号 ≤ 已完成轮号，简短确认并跳过"）；④ 完成出口（"无剩余工作时明确报告 DONE 并说明理由"）
-  - 注意 wire 字段遵循 `Schema.withDecodingDefaultKey` 兼容规则（见 AGENTS.md）
+- [x] **B1. round prompt 富化**
+  - `loop.ts` `buildCyclePrompt(round, { consecutiveDry, previous })`：新增 ① 上轮摘要行（`Loop.latestRoundResult` 从 round-result 存储取上轮 response 尾部 300 字符，跨重启可用，无需新 state 字段）；② `Idle status: N/3` dry 状态与 auto-pause 阈值提醒；③ duplicate-delivery 指令（已完成该轮则简短确认、不要重做、不要自造轮号）；④ DONE 出口（无实质工作时报告 DONE + 理由，不要跑 status-check 凑数轮）
+  - 测试：loop.test.ts 两个单测（有/无 context）；prompt.test.ts 集成测试（round 2 prompt 含上轮摘要 + Idle status 1/3）
 
-- [ ] **B2. cycle-on-project skill 增补纪律**
-  - 修复必须验证（编译/测试，至少语法级）；禁止向无人值守会话发阻塞式提问（客观正确的项自行决策）；VCS 操作与 edit 严格串行、jj 命令后立即 st 确认；每轮小步快走（单轮目标可控、避免 2h+ 超长轮）；跨轮用 todo/PLAN.md 维护持久计划而非散文记忆
+- [x] **B2. cycle-on-project skill 增补纪律**（`packages/core/src/plugin/skill/cycle-on-project.md`）
+  - Ironclad Rules 新增 3 条：会话无人值守禁止阻塞式提问（客观问题自决、主观问题选默认值并记录）；修复未验证不算完成（无验证路径先花一轮建验证环境）；VCS 与 edit 严格串行（jj 快照竞态纪律，历史搞乱先修历史）
+  - Scheduler 小节新增：每轮小步快走（一轮一个可验证单元，超长轮是循环与幻觉温床）；backlog 持久化到 todo/文件而非散文记忆
+  - Round Prompts 小节新增：解释 prompt 中的 Last completed iteration / Idle status / duplicate 提示如何解读；Termination 小节与 DONE 出口对齐（诚实 DONE 优于制造忙碌）
+  - 测试：packages/core skill 注册测试通过
 
-- [ ] **B3. /cycle 启动回执话术修正**
-  - "first run HH:MM" 与实际 idle-anchor 行为对齐（busy 时会顺延），避免用户预期偏差
+- [x] **B3. /cycle 启动回执话术修正**
+  - "first run HH:MM" → "first run ~HH:MM, then each round starts <interval> after the session turns idle"，与 idle-anchor 实际行为对齐
 
 ### Phase C — 引擎：判定与熔断（P1）
 
