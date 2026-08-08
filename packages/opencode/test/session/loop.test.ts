@@ -38,6 +38,7 @@ describe("session cycle scheduling", () => {
       consecutiveDry: 1,
       coalescedCount: 2,
       timezone: "local",
+      commandSeq: 0,
     }
     const decoded = Schema.decodeUnknownSync(Loop.SerializedLoopState)(state)
     expect(decoded).toEqual(state)
