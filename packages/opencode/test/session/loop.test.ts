@@ -1,6 +1,33 @@
 import { describe, expect, test } from "bun:test"
 import { Schema } from "effect"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Loop } from "@/session/loop"
+
+function toolPart(input: { tool: string; status: "completed" | "error"; command?: string }): SessionV1.Part {
+  return {
+    id: "p1",
+    messageID: "m2",
+    sessionID: "s1",
+    type: "tool",
+    tool: input.tool,
+    callID: "c1",
+    state:
+      input.status === "completed"
+        ? {
+            status: "completed",
+            input: input.command ? { command: input.command } : {},
+            output: "",
+            title: "",
+            metadata: {},
+            time: { start: 0, end: 1 },
+          }
+        : { status: "error", input: {}, error: "boom", time: { start: 0, end: 1 } },
+  } as SessionV1.Part
+}
+
+function round(...tools: SessionV1.Part[]) {
+  return [{ info: { id: "m2", role: "assistant" }, parts: tools }]
+}
 
 describe("session cycle scheduling", () => {
   test("parses compound durations", () => {
@@ -43,6 +70,25 @@ describe("session cycle scheduling", () => {
     expect(prompt).toContain("DONE")
   })
 
+  test("roundMadeProgress counts file-modifying tools and VCS mutations only", () => {
+    expect(Loop.roundMadeProgress(round(toolPart({ tool: "edit", status: "completed" })), "m1")).toBe(true)
+    expect(Loop.roundMadeProgress(round(toolPart({ tool: "edit", status: "error" })), "m1")).toBe(false)
+    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "jj split src/x.ts" })), "m1")).toBe(true)
+    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "git commit -m x" })), "m1")).toBe(true)
+    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "jj bookmark move main abc" })), "m1")).toBe(true)
+    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "jj st" })), "m1")).toBe(false)
+    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "git status && jj log" })), "m1")).toBe(false)
+    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "jj bookmark list" })), "m1")).toBe(false)
+    expect(Loop.roundMadeProgress(round(toolPart({ tool: "read", status: "completed" })), "m1")).toBe(false)
+  })
+
+  test("roundMadeProgress only counts messages past the boundary", () => {
+    const messages = round(toolPart({ tool: "edit", status: "completed" }))
+    expect(Loop.roundMadeProgress(messages, "m1")).toBe(true)
+    expect(Loop.roundMadeProgress(messages, "m2")).toBe(false)
+    expect(Loop.roundMadeProgress(messages, undefined)).toBe(true)
+  })
+
   test("round-trips a persisted cycle state", () => {
     const state: Loop.SerializedLoopState = {
       version: 1,
@@ -56,6 +102,7 @@ describe("session cycle scheduling", () => {
       running: false,
       consecutiveFailures: 0,
       consecutiveDry: 1,
+      consecutiveEmpty: 0,
       coalescedCount: 2,
       timezone: "local",
       commandSeq: 0,

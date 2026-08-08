@@ -1,11 +1,46 @@
 import { Effect, Fiber, Option, Schema } from "effect"
 import type { Storage } from "@/storage/storage"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 
 export const loopConfig = {
   minIntervalMs: 30_000,
   maxConsecutiveFailures: 5,
   maxDryIterations: 3,
+  // Provider returned nothing (no parts, zero output tokens) this many times
+  // in a row — the provider is broken, not the task; stop instead of pausing.
+  maxEmptyRounds: 2,
   maxResults: 100,
+}
+
+export const FILE_MODIFY_TOOLS = new Set(["edit", "write", "apply_patch"])
+
+// jj/git history or working-copy mutations never show up as
+// edit/write/apply_patch parts; without counting them, legitimate repository
+// tidying rounds (splitting an accidental file out of a commit, squashing,
+// rewording) are misjudged as idle. Read-only subcommands (st/log/diff/
+// status/bookmark list) deliberately don't match.
+const VCS_MUTATION_PATTERN =
+  /\b(?:jj|git)\s+(?:commit|split|squash|describe|abandon|rebase|new|merge|cherry-pick|revert|restore|reset|amend|undo|tag|bookmark\s+(?:move|create|delete|set|rename|track|untrack|forget))\b/
+
+// Did the round produce durable progress? Counts completed file-modifying
+// tool parts and completed bash parts that mutate VCS state, restricted to
+// assistant messages newer than the round boundary.
+export function roundMadeProgress(
+  messages: readonly { info: { id: string; role: string }; parts: readonly SessionV1.Part[] }[],
+  boundaryId: string | undefined,
+) {
+  return messages.some(
+    (msg) =>
+      msg.info.role === "assistant" &&
+      (!boundaryId || msg.info.id > boundaryId) &&
+      msg.parts.some((part) => {
+        if (part.type !== "tool" || part.state?.status !== "completed") return false
+        if (FILE_MODIFY_TOOLS.has(part.tool)) return true
+        if (part.tool !== "bash") return false
+        const command = (part.state.input as { command?: unknown } | undefined)?.command
+        return typeof command === "string" && VCS_MUTATION_PATTERN.test(command)
+      }),
+  )
 }
 
 const CycleSchedule = Schema.Struct({
@@ -36,6 +71,9 @@ export const SerializedLoopState = Schema.Struct({
   // Decode-only default so loop states persisted before this field existed
   // still recover instead of being discarded as invalid.
   consecutiveDry: Schema.Number.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
+  // Decode-only default so loop states persisted before this field existed
+  // still recover.
+  consecutiveEmpty: Schema.Number.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
   coalescedCount: Schema.Number,
   lastStatus: Schema.optional(Schema.Literals(["success", "fail"])),
   timezone: Schema.String,
@@ -68,6 +106,7 @@ export function serializeLoopState(state: LoopState): SerializedLoopState {
     running: state.running,
     consecutiveFailures: state.consecutiveFailures,
     consecutiveDry: state.consecutiveDry,
+    consecutiveEmpty: state.consecutiveEmpty,
     coalescedCount: state.coalescedCount,
     lastStatus: state.lastStatus,
     timezone: state.timezone,
@@ -125,7 +164,7 @@ export function buildCyclePrompt(
   }
   if (context && context.consecutiveDry > 0) {
     lines.push(
-      `Idle status: ${context.consecutiveDry}/${loopConfig.maxDryIterations} consecutive iterations without file modifications; the cycle auto-pauses at ${loopConfig.maxDryIterations}.`,
+      `Idle status: ${context.consecutiveDry}/${loopConfig.maxDryIterations} consecutive iterations without file or VCS changes; the cycle auto-pauses at ${loopConfig.maxDryIterations}.`,
     )
   }
   lines.push(

@@ -50,25 +50,26 @@
 - [x] **B3. /cycle 启动回执话术修正**
   - "first run HH:MM" → "first run ~HH:MM, then each round starts <interval> after the session turns idle"，与 idle-anchor 实际行为对齐
 
-### Phase C — 引擎：判定与熔断（P1）
+### Phase C — 引擎：判定与熔断（P1）✅ 已完成（2026-08-08）
 
-- [ ] **C1. dry 判定扩展**
-  - 现象：jj split 等纯 VCS 操作、bash 写文件被判 dry；18s/35s 乱序微轮计入 dry 凑出误暂停
-  - 方向：判定纳入 jj/git 产生工作副本变更的操作与 bash 副作用（或允许 agent 在轮末输出结构化"进展标记"自报）；微轮（无 assistant 工具调用或时长 < 阈值）不计入 dry
-  - 位置：`prompt.ts` `FILE_MODIFY_TOOLS` 及 dry 检测段
+- [x] **C1. dry 判定扩展**
+  - `Loop.roundMadeProgress`（loop.ts）：completed `edit`/`write`/`apply_patch` + completed bash 且命令匹配 VCS 变更 pattern（commit/split/squash/rebase/describe/bookmark move 等；`jj st`/`git status`/`jj log` 等只读刻意排除）→ `FILE_MODIFY_TOOLS` 移至 `Loop.FILE_MODIFY_TOOLS`
+  - 微轮豁免未做：A 阶段已消除乱序微轮根因，B1 prompt 又给了 DONE 出口，无需再开豁口
+  - 测试：loop.test.ts 8 组单测（工具类型 × VCS 命令 × boundary）
 
-- [ ] **C2. 重复工具调用熔断**
-  - 现象：同一 grep 机械重复 579 次 / 3h42m / 零 reasoning，烧掉会话 57% token
-  - 方向：检测"相同 tool + 相同参数"连续 N 次（建议 N=10 可配），中断当轮并注入警告消息；reasoning 完全缺失 + 高频工具调用作为辅助退化信号
-  - 位置：`processor.ts` 工具调用路径
+- [x] **C2. 重复工具调用熔断**
+  - `processor.ts` 跨 step doom-loop 熔断：service 级 `doomLoopTracker`（session → 相同 tool+stableStringify(input) 连续次数），达 `processorConfig.doomLoopHardLimit`（默认 10）即 throw 硬停当轮（turn error → cycle 计 failure，5 连 failure auto-stop）
+  - 关键发现：既有 per-step doom 检测（DOOM_LOOP_THRESHOLD=3）只看单条 assistant message 内的 parts，nimble-wolf 那种"每 provider turn 一次调用"的模式永远打不中；且默认 agent `doom_loop: "ask"` 在无人值守时要么 hang（question: allow 时）要么 DeniedError 终止 turn，都救不了跨 step 循环
+  - 测试：processor-effect.test.ts 跨 step 熔断（每 turn 一次相同 grep，第 3 turn 触发 Circuit breaker）
 
-- [ ] **C3. 僵尸/环境故障即时停止**
-  - 现象：项目目录已删、模型配置已消失、provider 连续空响应（0 token 无 parts），循环仍触发到凑满失败次数甚至挂 4 小时
-  - 方向：环境级错误（目录/模型不存在）立即停止 cycle；连续空响应 ≥2 次即停
+- [x] **C3. 僵尸/环境故障即时停止**
+  - 环境级错误立即停：`FATAL_ENVIRONMENT_PATTERN`（ProviderModelNotFound/ModelNotFound/realPath/ENOENT）命中即 clear state + 停止，不消耗失败预算；worker 成功路径（assistant message 带非 abort error → 现在计 failure）与 fail 路径都检测
+  - 空响应即停：`consecutiveEmpty` 新持久化字段（decode 默认兼容）；round 无可见输出 parts（text/reasoning/tool）且 output tokens=0 → 计数，`loopConfig.maxEmptyRounds`（默认 2）即 auto-stop；resume/采纳命令时复位
+  - 测试：prompt.test.ts 空响应 2 连即停（含 persisted state 清除与停止消息断言）
 
-- [ ] **C4. 单 step 停滞超时**
-  - 现象：空 reasoning 后单 step 挂 30 分钟无产出
-  - 方向：单 step 无产出超阈值（建议 10min 可配）告警，可配是否中断当轮
+- [x] **C4. 单 step 停滞超时**
+  - `processor.ts` stall watchdog：`processorConfig.stallTimeoutMs`（默认 10min，check 30s）无流事件且**无 tool 执行在途**（`ctx.toolcalls` 非空豁免，长 bash 不误伤）即 fail 当轮；错误为 NamedError.Unknown（不匹配 retryable pattern，不会被无限重试；也不含 AbortError 语义，cycle 计 failure 而非 user-abort）
+  - 测试：processor-effect.test.ts 停滞触发（reasoning 后 Stream.never，200ms 阈值）+ tool 在途豁免（挂起 tool-call 不停滞）
 
 ### Phase D — 引擎：上下文与恢复（P2）
 

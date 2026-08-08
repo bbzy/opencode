@@ -1169,3 +1169,167 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
     { config: cfg },
   ),
 )
+
+// ---------------------------------------------------------------------------
+// Guardrails: stall watchdog + cross-step doom-loop circuit breaker
+// ---------------------------------------------------------------------------
+
+const stallLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () => Stream.make(LLMEvent.reasoningStart({ id: "r1" })).pipe(Stream.concat(Stream.never)),
+  }),
+)
+const stallEnv = LayerNode.compile(root, [...replacements, [LLM.node, stallLLM]])
+const itStall = testEffect(stallEnv)
+
+const toolInFlightLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-1", name: "bash" }),
+        LLMEvent.toolInputEnd({ id: "call-1", name: "bash" }),
+        LLMEvent.toolCall({ id: "call-1", name: "bash", input: { command: "sleep 3600" }, providerExecuted: true }),
+      ).pipe(Stream.concat(Stream.never)),
+  }),
+)
+const toolInFlightEnv = LayerNode.compile(root, [...replacements, [LLM.node, toolInFlightLLM]])
+const itToolInFlight = testEffect(toolInFlightEnv)
+
+// One identical grep call per provider turn: the per-step doom-loop
+// permission check (3 identical calls in a single message) never fires, so
+// only the cross-step circuit breaker can stop this pattern.
+const doomLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-1", name: "grep", input: { pattern: "foo" }, providerExecuted: true }),
+        LLMEvent.toolResult({
+          id: "call-1",
+          name: "grep",
+          result: { type: "text", value: "no matches" },
+          providerExecuted: true,
+        }),
+        LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+        LLMEvent.finish({ reason: "tool-calls" }),
+      ),
+  }),
+)
+const doomEnv = LayerNode.compile(root, [...replacements, [LLM.node, doomLLM]])
+const itDoom = testEffect(doomEnv)
+
+function stallInput(parent: SessionV1.User, sessionID: SessionID, mdl: Provider.Model) {
+  return {
+    user: {
+      id: parent.id,
+      sessionID,
+      role: "user",
+      time: parent.time,
+      agent: parent.agent,
+      model: { providerID: ref.providerID, modelID: ref.modelID },
+    } satisfies SessionV1.User,
+    sessionID,
+    model: mdl,
+    agent: agent(),
+    system: [],
+    messages: [{ role: "user", content: "hi" }],
+    tools: {},
+  } satisfies LLM.StreamInput
+}
+
+itStall.live("session.processor stall watchdog fails a silent stream", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const originalTimeout = SessionProcessor.processorConfig.stallTimeoutMs
+        const originalCheck = SessionProcessor.processorConfig.stallCheckMs
+        SessionProcessor.processorConfig.stallTimeoutMs = 200
+        SessionProcessor.processorConfig.stallCheckMs = 50
+        try {
+          const { processors, session, provider } = yield* boot()
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "hi")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+          const value = yield* handle.process(stallInput(parent, chat.id, mdl))
+          expect(value).toBe("stop")
+          expect(JSON.stringify(handle.message.error)).toContain("stalled")
+        } finally {
+          SessionProcessor.processorConfig.stallTimeoutMs = originalTimeout
+          SessionProcessor.processorConfig.stallCheckMs = originalCheck
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
+itToolInFlight.live("session.processor stall watchdog stays quiet while a tool is executing", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const originalTimeout = SessionProcessor.processorConfig.stallTimeoutMs
+        const originalCheck = SessionProcessor.processorConfig.stallCheckMs
+        SessionProcessor.processorConfig.stallTimeoutMs = 200
+        SessionProcessor.processorConfig.stallCheckMs = 50
+        try {
+          const { processors, session, provider } = yield* boot()
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "hi")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+          const run = yield* handle.process(stallInput(parent, chat.id, mdl)).pipe(Effect.forkChild)
+          // The sleep is the test: well past the stall timeout, the watchdog
+          // must not fire because a tool execution is in flight.
+          yield* Effect.sleep("500 millis")
+          expect(handle.message.error).toBeUndefined()
+          yield* Fiber.interrupt(run)
+        } finally {
+          SessionProcessor.processorConfig.stallTimeoutMs = originalTimeout
+          SessionProcessor.processorConfig.stallCheckMs = originalCheck
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
+itDoom.live("session.processor circuit breaker stops a cross-step doom loop", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const original = SessionProcessor.processorConfig.doomLoopHardLimit
+        SessionProcessor.processorConfig.doomLoopHardLimit = 3
+        try {
+          const { processors, session, provider } = yield* boot()
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "hi")
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+
+          // Each provider turn is a fresh processor, exactly like runLoop's
+          // per-step handling; the tracker lives in the service and carries
+          // the repeat count across steps.
+          let lastHandle: SessionProcessor.Handle | undefined
+          let lastValue: SessionProcessor.Result | undefined
+          for (let step = 0; step < 3; step++) {
+            const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+            const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+            lastValue = yield* handle.process(stallInput(parent, chat.id, mdl))
+            lastHandle = handle
+          }
+
+          expect(lastValue).toBe("stop")
+          expect(JSON.stringify(lastHandle?.message.error)).toContain("Circuit breaker")
+        } finally {
+          SessionProcessor.processorConfig.doomLoopHardLimit = original
+        }
+      }),
+    { config: cfg },
+  ),
+)

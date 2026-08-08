@@ -2,7 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Image } from "@/image/image"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { Cause, Deferred, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Layer, Context, Scope, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
@@ -27,6 +27,32 @@ import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
+
+// Guardrails against runaway turns. Mutable so tests can shrink them.
+export const processorConfig = {
+  // A stream producing no events for this long (with no tool execution in
+  // flight) is treated as hung: the turn fails instead of waiting forever.
+  stallTimeoutMs: 10 * 60 * 1000,
+  stallCheckMs: 30 * 1000,
+  // Identical tool call (same tool + same input) this many times in a row,
+  // across steps, hard-stops the turn. The interactive doom-loop permission
+  // (DOOM_LOOP_THRESHOLD, single step) auto-allows in unattended sessions,
+  // which is how a 500x repeated grep can burn hours without this cap.
+  doomLoopHardLimit: 10,
+}
+
+// JSON.stringify with sorted object keys so argument order doesn't matter.
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+      .join(",")}}`
+  }
+  return JSON.stringify(value) ?? "undefined"
+}
+
 export type Result = "compact" | "stop" | "continue"
 
 export interface Handle {
@@ -72,6 +98,7 @@ interface ProcessorContext extends Input {
   needsCompaction: boolean
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
+  lastEventAt: number
 }
 
 type StreamEvent = LLMEvent
@@ -94,6 +121,10 @@ const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const database = yield* Database.Service
+    // Cross-step doom-loop tracker: identical tool call signatures with their
+    // consecutive repeat count, per session. The per-step permission check
+    // alone can't catch a model that repeats one call per provider turn.
+    const doomLoopTracker = new Map<SessionID, { signature: string; count: number }>()
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -111,6 +142,7 @@ const layer = Layer.effect(
         needsCompaction: false,
         currentText: undefined,
         reasoningMap: {},
+        lastEventAt: Date.now(),
       }
       let aborted = false
 
@@ -276,6 +308,7 @@ const layer = Layer.effect(
       }
 
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+        ctx.lastEventAt = Date.now()
         switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
@@ -349,6 +382,20 @@ const layer = Layer.effect(
                 ? { ...value.providerMetadata, providerExecuted: true }
                 : value.providerMetadata,
             }))
+
+            // Cross-step doom-loop circuit breaker: the per-step permission
+            // check below auto-allows in unattended sessions, so an identical
+            // call repeated across provider turns hard-stops the turn here.
+            const signature = `${value.name}:${stableStringify(input)}`
+            const tracked = doomLoopTracker.get(ctx.sessionID)
+            const doomCount = tracked?.signature === signature ? tracked.count + 1 : 1
+            doomLoopTracker.set(ctx.sessionID, { signature, count: doomCount })
+            if (doomCount >= processorConfig.doomLoopHardLimit) {
+              doomLoopTracker.delete(ctx.sessionID)
+              throw new Error(
+                `Circuit breaker: tool "${value.name}" was called with identical input ${doomCount} times in a row; the turn was stopped to break the loop.`,
+              )
+            }
 
             const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
               Effect.provideService(Database.Service, database),
@@ -653,10 +700,30 @@ const layer = Layer.effect(
             yield* status.set(ctx.sessionID, { type: "busy" })
             const stream = llm.stream(streamInput)
 
-            yield* stream.pipe(
-              Stream.tap((event) => handleEvent(event)),
-              Stream.takeUntil(() => ctx.needsCompaction),
-              Stream.runDrain,
+            // Stall watchdog: a stream that goes silent with no tool execution
+            // in flight is hung (provider dropped the connection without an
+            // error). Tool executions can legitimately run for a long time
+            // with no stream events in between, so those windows are exempt.
+            const stallWatch = Effect.gen(function* () {
+              while (true) {
+                yield* Effect.sleep(Duration.millis(processorConfig.stallCheckMs))
+                if (Object.keys(ctx.toolcalls).length > 0) continue
+                if (Date.now() - ctx.lastEventAt <= processorConfig.stallTimeoutMs) continue
+                return yield* Effect.fail(
+                  new Error(
+                    `LLM stream stalled: no events for ${Math.round(processorConfig.stallTimeoutMs / 1000)}s with no tool execution in flight`,
+                  ),
+                )
+              }
+            })
+
+            yield* Effect.raceFirst(
+              stream.pipe(
+                Stream.tap((event) => handleEvent(event)),
+                Stream.takeUntil(() => ctx.needsCompaction),
+                Stream.runDrain,
+              ),
+              stallWatch,
             )
           }).pipe(
             Effect.onInterrupt(() =>
