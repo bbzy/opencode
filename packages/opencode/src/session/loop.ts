@@ -9,6 +9,12 @@ export const loopConfig = {
   // Provider returned nothing (no parts, zero output tokens) this many times
   // in a row — the provider is broken, not the task; stop instead of pausing.
   maxEmptyRounds: 2,
+  // Proactively compact between rounds once the last round's token count
+  // reaches this fraction of the usable context. Overflow-triggered
+  // compaction fires only at the ceiling, where summarizing the whole
+  // history no longer fits and fails — compacting earlier keeps that path
+  // from ever running.
+  compactionThreshold: 0.7,
   maxResults: 100,
 }
 

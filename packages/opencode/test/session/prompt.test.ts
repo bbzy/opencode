@@ -3546,6 +3546,76 @@ it.instance(
 )
 
 it.instance(
+  "cycle proactively compacts between rounds near the context ceiling",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        const sessions = yield* Session.Service
+        // 70K tokens of 90K usable context: above the 0.7 proactive threshold
+        // (63K) but below the overflow ceiling, so only the cycle boundary
+        // compaction fires.
+        yield* llm.text("round one done", { usage: { input: 70_000, output: 200 } })
+        yield* llm.text("this is the summary")
+        yield* llm.text("round two done")
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            const state = stateMap[chat.id]
+            return state && state.rounds >= 2 ? (true as const) : undefined
+          }),
+          "cycle never completed two rounds",
+          "10 seconds",
+        )
+        expect(yield* llm.calls).toBe(3)
+        const msgs = yield* sessions.messages({ sessionID: chat.id, limit: 100 })
+        const hasCompactionPart = msgs.some((msg) => msg.parts.some((part) => part.type === "compaction"))
+        expect(hasCompactionPart).toBe(true)
+        const summaryMsg = msgs.find((msg) => msg.info.role === "assistant" && msg.info.summary === true)
+        expect(summaryMsg).toBeDefined()
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "interrupted-response retry lists the turn's completed tool calls",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, chat } = yield* boot()
+      // finish=unknown after a completed bash call: the retry prompt must
+      // tell the model what already ran so it doesn't re-apply the same work.
+      yield* llm.push(reply().tool("bash", { command: "echo first" }).unknown())
+      yield* llm.text("continued and done")
+      yield* user(chat.id, "do work")
+      yield* prompt.loop({ sessionID: chat.id })
+      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+      const warning = msgs.find(
+        (msg) =>
+          msg.info.role === "user" &&
+          msg.parts.some(
+            (part) => part.type === "text" && part.synthetic === true && part.text.includes("already completed successfully"),
+          ),
+      )
+      expect(warning).toBeDefined()
+      const text = warning?.parts.find((part) => part.type === "text")
+      expect(text?.type === "text" && text.text.includes("bash(")).toBe(true)
+      expect(text?.type === "text" && text.text.includes("echo first")).toBe(true)
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
   "scheduler exits quietly when another process takes over the ownership lease",
   () =>
     Effect.gen(function* () {
