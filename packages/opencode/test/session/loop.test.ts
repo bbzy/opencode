@@ -23,6 +23,26 @@ describe("session cycle scheduling", () => {
     expect(Loop.buildCyclePrompt(3)).toContain("[Cycle #3] Automated cycle — iteration 3.")
   })
 
+  test("cycle round prompts carry cross-round context", () => {
+    const prompt = Loop.buildCyclePrompt(5, {
+      consecutiveDry: 2,
+      previous: { round: 4, summary: "fixed the null deref in GraphAddConditionalNode" },
+    })
+    expect(prompt).toContain("[Cycle #5] Automated cycle — iteration 5.")
+    expect(prompt).toContain("Last completed iteration: #4 — fixed the null deref in GraphAddConditionalNode")
+    expect(prompt).toContain("Idle status: 2/3")
+    expect(prompt).toContain("duplicate delivery")
+    expect(prompt).toContain("DONE")
+  })
+
+  test("cycle round prompts omit context lines when there is nothing to report", () => {
+    const prompt = Loop.buildCyclePrompt(1, { consecutiveDry: 0 })
+    expect(prompt).not.toContain("Last completed iteration")
+    expect(prompt).not.toContain("Idle status")
+    expect(prompt).toContain("duplicate delivery")
+    expect(prompt).toContain("DONE")
+  })
+
   test("round-trips a persisted cycle state", () => {
     const state: Loop.SerializedLoopState = {
       version: 1,

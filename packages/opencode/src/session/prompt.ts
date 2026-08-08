@@ -1596,8 +1596,8 @@ mode: "cycle" as const,
       const queue = yield* Queue.dropping<"scheduled" | "explicit">(1)
       const runtime: { state?: Loop.LoopState } = {}
       const word = "Cycle"
-      const buildPrompt = (round: number) =>
-        Loop.buildCyclePrompt(round)
+      const buildPrompt = (round: number, consecutiveDry: number, previous?: { round: number; summary: string }) =>
+        Loop.buildCyclePrompt(round, { consecutiveDry, previous })
       // Set when another process took over the persisted ownership lease; the
       // scheduler then shuts down quietly without clobbering the new owner's
       // state or broadcasting a stop it never received.
@@ -1751,8 +1751,9 @@ mode: "cycle" as const,
           yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
 
           const round = current.rounds + 1
+          const previous = yield* Loop.latestRoundResult(storage, input.sessionID)
           const exit = yield* Effect.gen(function* () {
-            const fullPrompt = buildPrompt(round)
+            const fullPrompt = buildPrompt(round, current.consecutiveDry, previous)
             const before = yield* sessions.messages({ sessionID: input.sessionID, limit: 1 }).pipe(Effect.orDie)
             const boundaryId = before[0]?.info.id
             const result = yield* loopRun({
@@ -1869,7 +1870,7 @@ mode: "cycle" as const,
             yield* noReply(input.sessionID, undefined, `[${word} #${round}] Iteration failed: ${errorMsg}`)
             yield* Loop.persistRoundResult(storage, input.sessionID, round, {
               timestamp: yield* Clock.currentTimeMillis,
-              prompt: buildPrompt(round),
+              prompt: buildPrompt(round, current.consecutiveDry, previous),
               status: "fail",
               response: errorMsg,
             })
@@ -1955,7 +1956,9 @@ mode: "cycle" as const,
       }
 
       const replaced = existing ? "; replaced previous cycle" : ""
-      const text = `Cycle started: ${input.intervalStr}; first run ${new Date(input.nextRunAt).toTimeString().slice(0, 5)}; runs until stopped${replaced}`
+      // Rounds are idle-anchored, so the first run slips when the session is
+      // busy at nextRunAt — say "~" and set that expectation up front.
+      const text = `Cycle started: ${input.intervalStr}; first run ~${new Date(input.nextRunAt).toTimeString().slice(0, 5)}, then each round starts ${input.intervalStr.replace("every ", "")} after the session turns idle; runs until stopped${replaced}`
       const message = input.announce ? yield* noReply(input.sessionID, input.messageID, text) : undefined
       const state = yield* startLoopFiber({
         sessionID: input.sessionID,

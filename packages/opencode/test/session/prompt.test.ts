@@ -3471,6 +3471,40 @@ it.instance(
 )
 
 it.instance(
+  "round prompts carry the previous round summary and idle status",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("fixed the widget")
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
+        yield* llm.wait(2)
+        const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+        const round2 = msgs.find(
+          (msg) =>
+            msg.info.role === "user" &&
+            msg.parts.some((part) => part.type === "text" && part.text.includes("[Cycle #2]")),
+        )
+        const text = round2?.parts.find((part) => part.type === "text")
+        expect(text?.type).toBe("text")
+        if (text?.type !== "text") return
+        expect(text.text).toContain("Last completed iteration: #1 — fixed the widget")
+        expect(text.text).toContain("Idle status: 1/3")
+        expect(text.text).toContain("duplicate delivery")
+        expect(text.text).toContain("DONE")
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
   "scheduler exits quietly when another process takes over the ownership lease",
   () =>
     Effect.gen(function* () {
