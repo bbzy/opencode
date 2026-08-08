@@ -3273,6 +3273,7 @@ it.instance(
         consecutiveDry: 0,
         coalescedCount: 0,
         timezone: "local",
+        commandSeq: 0,
       })
       // Simulate a server restart: rebuild the prompt graph with a fresh memo
       // map so recovery runs again at layer init, sharing only this test's
@@ -3299,6 +3300,264 @@ it.instance(
         Effect.ensuring(Scope.close(scope, Exit.void)),
         Effect.ensuring(Loop.clearPersistedState(storage, chat.id).pipe(Effect.ignore)),
       )
+    }),
+  { config: cfg },
+  30_000,
+)
+
+const foreignLoopState = (now: number): Loop.SerializedLoopState => ({
+  version: 1,
+  intervalStr: "every 5m",
+  schedule: { type: "cycle", intervalMs: 300_000 },
+  rounds: 4,
+  startedAt: now - 600_000,
+  nextRunAt: now + 300_000,
+  paused: false,
+  pending: false,
+  running: false,
+  consecutiveFailures: 0,
+  consecutiveDry: 0,
+  coalescedCount: 0,
+  timezone: "local",
+  owner: { id: "other-process", at: now },
+  commandSeq: 2,
+})
+
+noLLMServer.instance(
+  "/cycle stop clears a loop owned by another process",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const storage = yield* Storage.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      yield* Loop.persistLoopState(storage, chat.id, foreignLoopState(Date.now()))
+      const result = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      const text = (result.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+      expect(text).toContain("another process")
+      expect((yield* Loop.readPersistedState(storage, chat.id)).type).toBe("missing")
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle status reports a loop owned by another process",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const storage = yield* Storage.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      yield* Loop.persistLoopState(storage, chat.id, foreignLoopState(Date.now()))
+      const result = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "status" })
+      const text = (result.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+      expect(text).toContain("Cycle active in another process: every 5m, 4 rounds completed")
+      yield* Loop.clearPersistedState(storage, chat.id)
+    }),
+  { config: cfg },
+)
+
+noLLMServer.instance(
+  "/cycle pause and resume mutate a loop owned by another process",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const storage = yield* Storage.Service
+      const chat = yield* sessions.create({ title: "Cycle" })
+      yield* Loop.persistLoopState(storage, chat.id, foreignLoopState(Date.now()))
+
+      const paused = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "pause" })
+      const pausedText = (paused.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+      expect(pausedText).toContain("another process")
+      const afterPause = yield* Loop.readPersistedState(storage, chat.id)
+      expect(afterPause.type).toBe("found")
+      if (afterPause.type === "found") {
+        expect(afterPause.state.paused).toBe(true)
+        expect(afterPause.state.commandSeq).toBe(3)
+      }
+
+      const resumed = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "resume" })
+      const resumedText = (resumed.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
+      expect(resumedText).toContain("another process")
+      const afterResume = yield* Loop.readPersistedState(storage, chat.id)
+      expect(afterResume.type).toBe("found")
+      if (afterResume.type === "found") {
+        expect(afterResume.state.paused).toBe(false)
+        expect(afterResume.state.commandSeq).toBe(4)
+      }
+      yield* Loop.clearPersistedState(storage, chat.id)
+    }),
+  { config: cfg },
+)
+
+it.instance(
+  "a coalesced cycle round leaves no stray prompt behind",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, chat } = yield* boot()
+      const gate = yield* Deferred.make<void>()
+      yield* llm.hold("first round", deferredAsPromise(gate))
+      const first = yield* prompt
+        .loopRun({
+          sessionID: chat.id,
+          model: ref,
+          parts: [{ type: "text", text: "[Cycle #1] Automated cycle — iteration 1." }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      // The session drain is held by the first round: a second loopRun must
+      // fail busy without admitting its "[Cycle #N]" user message.
+      const busy = yield* prompt
+        .loopRun({
+          sessionID: chat.id,
+          model: ref,
+          parts: [{ type: "text", text: "[Cycle #2] Automated cycle — iteration 2." }],
+        })
+        .pipe(
+          Effect.map(() => "ran" as const),
+          Effect.catchTag("SessionBusyError", () => Effect.succeed("busy" as const)),
+        )
+      expect(busy).toBe("busy")
+      yield* Deferred.succeed(gate, void 0)
+      yield* Fiber.await(first)
+      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+      const cyclePrompts = msgs.filter(
+        (msg) =>
+          msg.info.role === "user" &&
+          msg.parts.some((part) => part.type === "text" && part.text.includes("[Cycle #")),
+      )
+      expect(cyclePrompts).toHaveLength(1)
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "an auto-paused cycle fires no further rounds",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalMaxDry = loopConfig.maxDryIterations
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxDryIterations = 1
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("no file changes")
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
+        yield* llm.wait(1)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            return stateMap[chat.id]?.paused ? (true as const) : undefined
+          }),
+          "loop never paused after a dry iteration",
+          "10 seconds",
+        )
+        // The sleep is the test: a paused cycle must stay quiet instead of
+        // firing a pending scheduled tick seconds after the pause.
+        yield* Effect.sleep(Duration.millis(500))
+        expect(yield* llm.calls).toBe(1)
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        loopConfig.maxDryIterations = originalMaxDry
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "scheduler exits quietly when another process takes over the ownership lease",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        const storage = yield* Storage.Service
+        yield* llm.text("round")
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
+        yield* llm.wait(1)
+        // Another process takes over: foreign owner with a bumped commandSeq.
+        // Re-assert it on every poll so a renewal racing the write cannot
+        // clobber the takeover back.
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            if (stateMap[chat.id] === undefined) return true as const
+            const persisted = yield* Loop.readPersistedState(storage, chat.id)
+            if (persisted.type === "found" && persisted.state.owner?.id !== "other-process") {
+              yield* Loop.persistLoopState(storage, chat.id, {
+                ...persisted.state,
+                owner: { id: "other-process", at: Date.now() },
+                commandSeq: persisted.state.commandSeq + 1,
+              })
+            }
+            return undefined
+          }),
+          "scheduler did not exit after losing ownership",
+          "10 seconds",
+        )
+        // The loser must not clobber the new owner's persisted state.
+        const after = yield* Loop.readPersistedState(storage, chat.id)
+        expect(after.type).toBe("found")
+        if (after.type === "found") expect(after.state.owner?.id).toBe("other-process")
+        yield* Loop.clearPersistedState(storage, chat.id)
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "cross-process resume is adopted at the next tick",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        const storage = yield* Storage.Service
+        yield* llm.text("round")
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
+        yield* llm.wait(1)
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "pause" })
+        // Simulate a resume issued from another opencode process. Re-assert it
+        // on every poll so a ticker renewal racing the write cannot clobber it.
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const calls = yield* llm.calls
+            if (calls >= 2) return true as const
+            const persisted = yield* Loop.readPersistedState(storage, chat.id)
+            if (persisted.type === "found" && persisted.state.paused) {
+              yield* Loop.persistLoopState(storage, chat.id, {
+                ...persisted.state,
+                paused: false,
+                consecutiveDry: 0,
+                consecutiveFailures: 0,
+                nextRunAt: Date.now(),
+                commandSeq: persisted.state.commandSeq + 1,
+              })
+            }
+            return undefined
+          }),
+          "cross-process resume was never adopted",
+          "10 seconds",
+        )
+        const stateMap = yield* prompt.loopState()
+        expect(stateMap[chat.id]?.paused).toBe(false)
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
     }),
   { config: cfg },
   30_000,

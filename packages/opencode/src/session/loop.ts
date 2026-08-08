@@ -16,6 +16,12 @@ const CycleSchedule = Schema.Struct({
 export const ScheduleInfo = CycleSchedule
 export type ScheduleInfo = Schema.Schema.Type<typeof ScheduleInfo>
 
+export const LoopOwner = Schema.Struct({
+  id: Schema.String,
+  at: Schema.Number,
+})
+export type LoopOwner = Schema.Schema.Type<typeof LoopOwner>
+
 export const SerializedLoopState = Schema.Struct({
   version: Schema.Literal(1),
   intervalStr: Schema.String,
@@ -33,6 +39,12 @@ export const SerializedLoopState = Schema.Struct({
   coalescedCount: Schema.Number,
   lastStatus: Schema.optional(Schema.Literals(["success", "fail"])),
   timezone: Schema.String,
+  // Cross-process single ownership: the owning process renews this lease at
+  // every tick; other processes leave the loop alone while the lease is fresh.
+  owner: Schema.optional(LoopOwner),
+  // Bumped by pause/resume commands so schedulers in other processes can tell
+  // command mutations apart from their own last persist.
+  commandSeq: Schema.Number.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
 })
 export type SerializedLoopState = Schema.Schema.Type<typeof SerializedLoopState>
 
@@ -59,7 +71,16 @@ export function serializeLoopState(state: LoopState): SerializedLoopState {
     coalescedCount: state.coalescedCount,
     lastStatus: state.lastStatus,
     timezone: state.timezone,
+    owner: state.owner,
+    commandSeq: state.commandSeq,
   }
+}
+
+// How long an ownership lease stays fresh without renewal. The owner renews
+// once per interval, so two intervals of silence (with a floor for very short
+// intervals) means the owning process is gone.
+export function ownerLeaseMs(intervalMs: number) {
+  return Math.max(2 * intervalMs, 120_000)
 }
 
 export function timezone() {

@@ -1525,9 +1525,19 @@ const layer = Layer.effect(
       Effect.fn("SessionPrompt.loopRun")(function* (input: PromptInput) {
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
         yield* revert.cleanup(session)
-        yield* createUserMessage(input)
-        yield* sessions.touch(input.sessionID)
-        return yield* state.tryRun(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+        // The prompt message is admitted only after the drain is acquired: a
+        // busy session fails with SessionBusyError before any user message
+        // exists, so a coalesced cycle round leaves no stray "[Cycle #N]"
+        // prompt behind (and does not consume the round number either).
+        return yield* state.tryRun(
+          input.sessionID,
+          lastAssistant(input.sessionID),
+          Effect.gen(function* () {
+            yield* createUserMessage(input).pipe(Effect.orDie)
+            yield* sessions.touch(input.sessionID)
+            return yield* runLoop(input.sessionID)
+          }),
+        )
       })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
@@ -1538,6 +1548,10 @@ const layer = Layer.effect(
     })
 
     const activeCycles = new Map<SessionID, Loop.LoopState>()
+    // Process-lifetime identity for cross-process loop ownership: the owning
+    // process renews a lease in the persisted loop state at every tick, and
+    // other processes leave a freshly-leased loop alone.
+    const loopOwnerId = ulid()
 
     const noReply = (sessionID: SessionID, messageID: MessageID | undefined, text: string) =>
       prompt({ sessionID, messageID, noReply: true, parts: [{ type: "text" as const, text }] })
@@ -1576,13 +1590,18 @@ mode: "cycle" as const,
       consecutiveFailures: number
       consecutiveDry: number
       coalescedCount: number
+      commandSeq: number
       lastStatus?: "success" | "fail"
     }) {
-      const queue = yield* Queue.dropping<void>(1)
+      const queue = yield* Queue.dropping<"scheduled" | "explicit">(1)
       const runtime: { state?: Loop.LoopState } = {}
       const word = "Cycle"
       const buildPrompt = (round: number) =>
         Loop.buildCyclePrompt(round)
+      // Set when another process took over the persisted ownership lease; the
+      // scheduler then shuts down quietly without clobbering the new owner's
+      // state or broadcasting a stop it never received.
+      let superseded = false
       // Last busy→idle transition for this session; drives the cycle mode's
       // idle-anchored schedule. Bootstrapped to the fiber start so a cycle
       // started on a long-idle session fires on time.
@@ -1599,21 +1618,28 @@ mode: "cycle" as const,
         // coalesced counter; the ticker simply advances to the next anchor.
         if (current.paused) return
         const st = yield* status.get(input.sessionID).pipe(Effect.catchCause(() => Effect.succeed({ type: "idle" as const })))
-        if (st.type === "busy" && !opts?.queueWhenBusy) {
+        // The current.running check closes the idle-blip window between the
+        // worker picking up a round and runLoop marking the session busy,
+        // where a tick could queue a round that fires seconds after the
+        // previous one ends instead of one full idle interval later.
+        if ((st.type === "busy" || current.running) && !opts?.queueWhenBusy) {
           current.coalescedCount++
           yield* persist
           yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
           return
         }
-        const accepted = yield* Queue.offer(queue, undefined)
-        if (!accepted) current.coalescedCount++
-        current.pending = true
+        const accepted = yield* Queue.offer(queue, opts?.queueWhenBusy ? "explicit" : "scheduled")
+        if (!accepted) {
+          current.coalescedCount++
+        } else {
+          current.pending = true
+        }
         yield* persist
         yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
       })
 
-      const ticker = Effect.forever(
-        Effect.gen(function* () {
+      const ticker = Effect.gen(function* () {
+        while (true) {
           const current = runtime.state
           if (!current) return yield* Effect.never
           const now = yield* Clock.currentTimeMillis
@@ -1629,17 +1655,53 @@ mode: "cycle" as const,
               yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
             }
           })
-          if (current.paused) return yield* defer(wakeAt + intervalMs)
+          // The persisted state is the cross-process source of truth: another
+          // process may have stopped the loop, issued pause/resume commands,
+          // or taken over ownership entirely.
+          const persisted = yield* Loop.readPersistedState(storage, input.sessionID)
+          if (persisted.type === "missing") {
+            yield* Effect.logInfo("loop stopped externally; scheduler exiting", { "session.id": input.sessionID })
+            return
+          }
+          if (persisted.type === "found") {
+            if (persisted.state.owner && persisted.state.owner.id !== loopOwnerId) {
+              superseded = true
+              yield* Effect.logInfo("loop owned by another process; scheduler exiting", {
+                "session.id": input.sessionID,
+              })
+              return
+            }
+            // Commands issued in another process bump commandSeq; adopt their
+            // mutations here so cross-process pause/resume takes effect.
+            if (persisted.state.commandSeq > current.commandSeq) {
+              current.commandSeq = persisted.state.commandSeq
+              current.paused = persisted.state.paused
+              current.consecutiveDry = persisted.state.consecutiveDry
+              current.consecutiveFailures = persisted.state.consecutiveFailures
+            }
+          }
+          // Renew the ownership lease so other processes leave this loop alone.
+          current.owner = { id: loopOwnerId, at: wakeAt }
+          if (current.paused) {
+            yield* defer(wakeAt + intervalMs)
+            continue
+          }
           const st = yield* status
             .get(input.sessionID)
             .pipe(Effect.catchCause(() => Effect.succeed({ type: "idle" as const })))
-          if (st.type === "busy") return yield* defer(wakeAt + intervalMs)
+          if (st.type === "busy" || current.running) {
+            yield* defer(wakeAt + intervalMs)
+            continue
+          }
           const idleTarget = (yield* Ref.get(lastIdleAt)) + intervalMs
-          if (idleTarget > wakeAt) return yield* defer(idleTarget)
+          if (idleTarget > wakeAt) {
+            yield* defer(idleTarget)
+            continue
+          }
           yield* defer(wakeAt + intervalMs)
           yield* trigger().pipe(Effect.catchCause(() => Effect.void))
-        }),
-      )
+        }
+      })
 
       const idleWatch =
         events.subscribe(SessionStatusEvent.Status).pipe(
@@ -1654,16 +1716,25 @@ mode: "cycle" as const,
 
       const worker = Effect.gen(function* () {
         while (true) {
-          yield* Queue.take(queue)
+          const tag = yield* Queue.take(queue)
           const current = runtime.state
           if (!current) return
-          // Wait out pauses and busy sessions instead of dropping the queued
-          // round: explicit triggers (/loop run, resume) are queued behind busy
-          // work, and a scheduled tick can race ahead of a user turn starting.
+          // Wait out busy sessions (and pauses for explicit triggers): /cycle
+          // run and resume are queued behind busy work, and a scheduled tick
+          // can race ahead of a user turn starting. A scheduled tick caught by
+          // a pause is dropped instead of waited out, so pausing an automated
+          // schedule actually holds until an explicit resume.
           while (true) {
             const st = yield* status.get(input.sessionID).pipe(Effect.catchCause(() => Effect.succeed({ type: "idle" as const })))
             if (!current.paused && st.type !== "busy") break
+            if (current.paused && tag === "scheduled") break
             yield* Effect.sleep(Duration.millis(100))
+          }
+          if (current.paused && tag === "scheduled") {
+            current.pending = false
+            yield* persist
+            yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
+            continue
           }
           while (Option.isSome(yield* Queue.poll(queue))) current.coalescedCount++
           // A deleted session can no longer host rounds; stop cleanly instead
@@ -1826,6 +1897,9 @@ mode: "cycle" as const,
         Effect.ensuring(
           Effect.gen(function* () {
             if (activeCycles.get(input.sessionID) === runtime.state) activeCycles.delete(input.sessionID)
+            // A superseded scheduler must not clobber the new owner's
+            // persisted state or broadcast a stop it never received.
+            if (superseded) return
             yield* Loop.clearPersistedState(storage, input.sessionID).pipe(Effect.ignore)
             yield* publishCycleState(input.sessionID, null).pipe(Effect.ignore)
           }),
@@ -1854,6 +1928,8 @@ mode: "cycle" as const,
         coalescedCount: input.coalescedCount,
         lastStatus: input.lastStatus,
         timezone: Loop.timezone(),
+        owner: { id: loopOwnerId, at: input.startedAt },
+        commandSeq: input.commandSeq,
       }
       runtime.state = loopState
       activeCycles.set(input.sessionID, loopState)
@@ -1892,6 +1968,7 @@ mode: "cycle" as const,
         consecutiveFailures: 0,
         consecutiveDry: 0,
         coalescedCount: 0,
+        commandSeq: 0,
       })
       return { text, message }
     })
@@ -1996,7 +2073,19 @@ mode: "cycle" as const,
       if (subcommand === "stop") {
         const existing = activeCycles.get(input.sessionID)
         if (!existing) {
-          return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
+          const persisted = yield* Loop.readPersistedState(storage, input.sessionID)
+          if (persisted.type !== "found") {
+            return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
+          }
+          // The loop's scheduler lives in another opencode process; clearing
+          // the persisted state tells it to shut down at its next tick.
+          yield* Loop.clearPersistedState(storage, input.sessionID)
+          yield* publishCycleState(input.sessionID, null).pipe(Effect.ignore)
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            `Cycle stopped (ran ${persisted.state.rounds} rounds in another process; it shuts down within one interval).`,
+          )
         }
         const rounds = existing.rounds
         const failures = existing.consecutiveFailures
@@ -2033,18 +2122,47 @@ mode: "cycle" as const,
             `Cycle active: ${existing.intervalStr}${stateInfo}, ${parts.join(", ")}`,
           )
         }
+        const persisted = yield* Loop.readPersistedState(storage, input.sessionID)
+        if (persisted.type === "found") {
+          const parts = [`${persisted.state.rounds} rounds completed`]
+          if (persisted.state.paused) parts.push("paused")
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            `Cycle active in another process: ${persisted.state.intervalStr}, ${parts.join(", ")}`,
+          )
+        }
         return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
       }
 
       if (subcommand === "pause") {
         const existing = activeCycles.get(input.sessionID)
         if (!existing) {
-          return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
+          const persisted = yield* Loop.readPersistedState(storage, input.sessionID)
+          if (persisted.type !== "found") {
+            return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
+          }
+          if (persisted.state.paused) {
+            return yield* noReply(input.sessionID, input.messageID, `Cycle is already paused.`)
+          }
+          // The scheduler lives in another process and adopts this mutation
+          // at its next tick (commandSeq guards against clobbering).
+          yield* Loop.persistLoopState(storage, input.sessionID, {
+            ...persisted.state,
+            paused: true,
+            commandSeq: persisted.state.commandSeq + 1,
+          })
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            `Cycle paused after ${persisted.state.rounds} rounds (running in another process; takes effect within one interval). Use /cycle resume to continue.`,
+          )
         }
         if (existing.paused) {
           return yield* noReply(input.sessionID, input.messageID, `Cycle is already paused.`)
         }
         existing.paused = true
+        existing.commandSeq++
         yield* Loop.persistLoopState(storage, input.sessionID, Loop.serializeLoopState(existing))
         yield* publishCycleState(input.sessionID, existing).pipe(Effect.ignore)
         return yield* noReply(
@@ -2057,7 +2175,29 @@ mode: "cycle" as const,
       if (subcommand === "resume") {
         const existing = activeCycles.get(input.sessionID)
         if (!existing) {
-          return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
+          const persisted = yield* Loop.readPersistedState(storage, input.sessionID)
+          if (persisted.type !== "found") {
+            return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
+          }
+          if (!persisted.state.paused) {
+            return yield* noReply(input.sessionID, input.messageID, `Cycle is not paused.`)
+          }
+          // The scheduler lives in another process and adopts this mutation
+          // at its next tick (commandSeq guards against clobbering).
+          const now = yield* Clock.currentTimeMillis
+          yield* Loop.persistLoopState(storage, input.sessionID, {
+            ...persisted.state,
+            paused: false,
+            consecutiveDry: 0,
+            consecutiveFailures: 0,
+            nextRunAt: now + persisted.state.schedule.intervalMs,
+            commandSeq: persisted.state.commandSeq + 1,
+          })
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            `Cycle resumed (running in another process; resumes within one interval). ${persisted.state.rounds} rounds completed so far.`,
+          )
         }
         if (!existing.paused) {
           return yield* noReply(input.sessionID, input.messageID, `Cycle is not paused.`)
@@ -2065,6 +2205,7 @@ mode: "cycle" as const,
         existing.paused = false
         existing.consecutiveDry = 0
         existing.consecutiveFailures = 0
+        existing.commandSeq++
         const now = yield* Clock.currentTimeMillis
         const nextRunAt = Loop.nextScheduledAt(existing.schedule, now)
         if (nextRunAt) existing.nextRunAt = nextRunAt
@@ -2084,6 +2225,14 @@ mode: "cycle" as const,
       if (subcommand === "run") {
         const existing = activeCycles.get(input.sessionID)
         if (!existing) {
+          const persisted = yield* Loop.readPersistedState(storage, input.sessionID)
+          if (persisted.type === "found") {
+            return yield* noReply(
+              input.sessionID,
+              input.messageID,
+              `Cycle is running in another process; explicit runs are only available in the owning process. Use /cycle resume or wait for the next tick.`,
+            )
+          }
           return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
         }
         if (existing.paused) {
@@ -2240,52 +2389,69 @@ mode: "cycle" as const,
       return result
     })
 
+    const recoverLoopSession: (sessionID: SessionID) => Effect.Effect<void> = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+    ) {
+      if (activeCycles.has(sessionID)) return
+      const recovered = yield* Loop.readPersistedState(storage, sessionID)
+      if (recovered.type !== "found") return
+      const persisted = recovered.state
+      const now = yield* Clock.currentTimeMillis
+      // A fresh lease means another live process owns this loop. Stand by
+      // until the lease would have gone stale, then re-check: if that process
+      // died without cleanup we take over, otherwise we stay out of its way.
+      const leaseMs = Loop.ownerLeaseMs(persisted.schedule.intervalMs)
+      const owner = persisted.owner
+      if (owner && owner.id !== loopOwnerId && now - owner.at < leaseMs) {
+        yield* Effect.sleep(Duration.millis(owner.at + leaseMs - now + 1))
+        return yield* recoverLoopSession(sessionID)
+      }
+      const nextRunAt = Loop.nextScheduledAt(persisted.schedule, now)
+      if (!nextRunAt) {
+        yield* Loop.clearPersistedState(storage, sessionID)
+        return
+      }
+      // A deleted session can no longer host rounds; stop cleanly.
+      const session = yield* sessions.get(sessionID).pipe(Effect.option)
+      if (Option.isNone(session)) {
+        yield* Loop.clearPersistedState(storage, sessionID)
+        return
+      }
+      // Recovery runs outside any request scope, so the forked loop fiber
+      // would otherwise carry no InstanceRef and every per-instance lookup
+      // (Agent.defaultInfo, model resolution) would die at the first round.
+      const ctx = yield* instanceStore.load({ directory: session.value.directory })
+      yield* startLoopFiber({
+        sessionID,
+        intervalStr: persisted.intervalStr,
+        schedule: persisted.schedule,
+        nextRunAt,
+        startRound: persisted.rounds,
+        startedAt: persisted.startedAt,
+        paused: persisted.paused,
+        consecutiveFailures: persisted.consecutiveFailures,
+        consecutiveDry: persisted.consecutiveDry,
+        coalescedCount: persisted.coalescedCount,
+        commandSeq: persisted.commandSeq,
+        lastStatus: persisted.lastStatus,
+      }).pipe(Effect.provideService(InstanceRef, ctx))
+      yield* Effect.logInfo("loop auto-recovered", { "session.id": sessionID, rounds: persisted.rounds })
+    })
+
     const recoverPersistedCycles = Effect.fn("SessionPrompt.recoverPersistedCycles")(function* () {
       const entries = yield* storage.list(["loop"]).pipe(Effect.orElseSucceed(() => []))
       for (const key of entries) {
         if (key.length !== 3 || key[2] !== "state") continue
         const sessionID = SessionID.make(key[1])
-        if (activeCycles.has(sessionID)) continue
-        yield* Effect.gen(function* () {
-          const recovered = yield* Loop.readPersistedState(storage, sessionID)
-          if (recovered.type !== "found") return
-          const persisted = recovered.state
-          const now = yield* Clock.currentTimeMillis
-          const nextRunAt = Loop.nextScheduledAt(persisted.schedule, now)
-          if (!nextRunAt) {
-            yield* Loop.clearPersistedState(storage, sessionID)
-            return
-          }
-          // A deleted session can no longer host rounds; stop cleanly.
-          const session = yield* sessions.get(sessionID).pipe(Effect.option)
-          if (Option.isNone(session)) {
-            yield* Loop.clearPersistedState(storage, sessionID)
-            return
-          }
-          // Recovery runs outside any request scope, so the forked loop fiber
-          // would otherwise carry no InstanceRef and every per-instance lookup
-          // (Agent.defaultInfo, model resolution) would die at the first round.
-          const ctx = yield* instanceStore.load({ directory: session.value.directory })
-          yield* startLoopFiber({
-            sessionID,
-            intervalStr: persisted.intervalStr,
-            schedule: persisted.schedule,
-            nextRunAt,
-            startRound: persisted.rounds,
-            startedAt: persisted.startedAt,
-            paused: persisted.paused,
-            consecutiveFailures: persisted.consecutiveFailures,
-            consecutiveDry: persisted.consecutiveDry,
-            coalescedCount: persisted.coalescedCount,
-            lastStatus: persisted.lastStatus,
-          }).pipe(Effect.provideService(InstanceRef, ctx))
-          yield* Effect.logInfo("loop auto-recovered", { "session.id": sessionID, rounds: persisted.rounds })
-        }).pipe(
+        // Fork per session: a foreign-owned loop's standby wait must not block
+        // recovering the remaining sessions or finishing service init.
+        yield* recoverLoopSession(sessionID).pipe(
           Effect.catchCause((cause) =>
             Cause.hasInterruptsOnly(cause)
               ? Effect.interrupt
               : Effect.logError("loop recovery failed", { "session.id": sessionID, cause: Cause.pretty(cause) }),
           ),
+          Effect.forkIn(scope),
         )
       }
     })
