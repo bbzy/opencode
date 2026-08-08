@@ -14,8 +14,8 @@
 
 ## 相关代码
 
-- `packages/opencode/src/session/prompt.ts` — `startLoopFiber`（worker + ticker + idleWatch）、dry 判定与 auto-pause、trigger/coalesce、resume/stop
-- `packages/opencode/src/session/loop.ts` — `loopConfig`、round prompt 生成 `buildCyclePrompt`、`persistLoopState`
+- `packages/opencode/src/session/prompt.ts` — `startLoopFiber`（worker + ticker + idleWatch）、`FILE_MODIFY_TOOLS`（行 96）、dry 判定与 auto-pause（行 1737/1756）、trigger/coalesce（行 1595-1602）、resume/stop（行 2048-2097）
+- `packages/opencode/src/session/loop.ts` — `loopConfig`（行 7）、round prompt 生成 `cyclePrompt`（行 95）、`persistLoopState`（行 106）
 - `packages/opencode/src/session/processor.ts` — 工具调用路径（熔断挂点候选）
 - cycle-on-project skill — 内置 skill 定义（提示词纪律项）
 
@@ -71,15 +71,17 @@
   - `processor.ts` stall watchdog：`processorConfig.stallTimeoutMs`（默认 10min，check 30s）无流事件且**无 tool 执行在途**（`ctx.toolcalls` 非空豁免，长 bash 不误伤）即 fail 当轮；错误为 NamedError.Unknown（不匹配 retryable pattern，不会被无限重试；也不含 AbortError 语义，cycle 计 failure 而非 user-abort）
   - 测试：processor-effect.test.ts 停滞触发（reasoning 后 Stream.never，200ms 阈值）+ tool 在途豁免（挂起 tool-call 不停滞）
 
-### Phase D — 引擎：上下文与恢复（P2）
+### Phase D — 引擎：上下文与恢复（P2）✅ 已完成（2026-08-08）
 
-- [ ] **D1. 轮次边界上下文管理**
-  - 现象：5 个会话 0 次成功 compaction，单步输入涨到 473K/510K；轮次边界全量冷读是 token 主因（cache.read=0 贡献 41M/43.9M）
-  - 方向：轮末上下文超阈值（如 60%）时主动 compaction；排查缓存前缀被打翻的原因（不断变化的状态/时间戳注入位置），稳定前缀
+- [x] **D1. 轮次边界上下文管理**
+  - `loopRun` 在 drain 内、admit cycle prompt 之前跑 `maybeCycleCompaction`：上轮 lastFinished assistant 的 token 计数 ≥ `usable` × `loopConfig.compactionThreshold`（默认 0.7）即 create+process 一次 compaction，下一轮以小上下文起步
+  - 根因认知：overflow 触发的 compaction 只在撞到上限时才跑，此时把全部历史序列化成一条消息做摘要已经装不下（"Conversation history too large to compact"），会话直接变砖（nimble-panda 487K 案例）；主动压缩让应急路径永远不被使用
+  - 缓存前缀打翻的"reminder 洪峰"查实来自用户环境的 jj 插件注入，非本 repo 代码，不在本项处理
+  - 测试：70K/90K usable 触发边界 compaction（compaction part + summary message 断言），且只 3 次 llm 调用（round1 + summary + round2）
 
-- [ ] **D2. 流中断恢复去重**
-  - 现象：流中断（finish reason: unknown）恢复后同轮重做，同一 edit 成功应用两次、同一总结报告两遍
-  - 方向：恢复续跑前检查当轮已完成的工具调用，注入"已完成的操作清单"避免重复应用
+- [x] **D2. 流中断恢复去重**
+  - `finish: "unknown"` 重试 prompt 追加当轮已 completed 的工具调用清单（tool + input 截断 200 字符，最多 20 条）："do NOT re-apply them or re-report their results"
+  - 测试：bash 完成后 finish=unknown，断言 synthetic 警告含 "already completed successfully" 与具体调用
 
 ### Phase E — 端到端验证
 

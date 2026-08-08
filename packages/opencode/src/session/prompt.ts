@@ -13,6 +13,7 @@ import { Provider } from "@/provider/provider"
 import { type Tool as AITool, tool, jsonSchema } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
 import { SessionCompaction } from "./compaction"
+import { usable } from "./overflow"
 import { SystemPrompt } from "./system"
 import { Instruction } from "./instruction"
 import { Plugin } from "../plugin"
@@ -107,6 +108,7 @@ function roundErrorMessage(error: NonNullable<SessionV1.Assistant["error"]>) {
   const data = error.data
   return isRecord(data) && typeof data.message === "string" ? data.message : error.name
 }
+
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
 
 IMPORTANT:
@@ -1452,6 +1454,21 @@ const layer = Layer.effect(
                   "session.id": sessionID,
                   messageID: handle.message.id,
                 })
+                // Resume replay protection: tell the model which tool calls
+                // already completed in this turn. Without this, models redo
+                // the turn from scratch and successfully re-apply the same
+                // edits (or re-report the same results) after a stream
+                // interruption.
+                const interruptedParts = yield* MessageV2.parts(handle.message.id).pipe(
+                  Effect.provideService(Database.Service, database),
+                )
+                const completedTools = interruptedParts.filter(
+                  (part): part is SessionV1.ToolPart => part.type === "tool" && part.state.status === "completed",
+                )
+                const completedList = completedTools
+                  .slice(-20)
+                  .map((part) => `- ${part.tool}(${JSON.stringify(part.state.input).slice(0, 200)})`)
+                  .join("\n")
                 const warnMsg: SessionV1.User = {
                   id: MessageID.ascending(),
                   sessionID,
@@ -1467,7 +1484,11 @@ const layer = Layer.effect(
                   sessionID,
                   type: "text",
                   synthetic: true,
-                  text: COMPLETION_INTERRUPTED_WARNING,
+                  text:
+                    COMPLETION_INTERRUPTED_WARNING +
+                    (completedList
+                      ? `\n\nThe following tool calls already completed successfully in this turn — do NOT re-apply them or re-report their results; continue from where you left off:\n${completedList}`
+                      : ""),
                 })
                 return "continue" as const
               }
@@ -1533,6 +1554,50 @@ const layer = Layer.effect(
       return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
     })
 
+    // Proactive compaction for cycle rounds, run inside the drain before the
+    // new prompt is admitted. Overflow-triggered compaction fires only at the
+    // context ceiling, where serializing the whole history for summarization
+    // no longer fits and fails ("Conversation history too large to compact"),
+    // bricking the session. Compacting once the previous round's token count
+    // crosses loopConfig.compactionThreshold keeps every round starting with
+    // a small context and the emergency path unused.
+    const maybeCycleCompaction = Effect.fnUntraced(function* (sessionID: SessionID) {
+      if ((yield* config.get()).compaction?.auto === false) return
+      const msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+        Effect.provideService(Database.Service, database),
+      )
+      const { finished: lastFinished } = MessageV2.latest(msgs)
+      if (!lastFinished || lastFinished.summary === true) return
+      const count =
+        lastFinished.tokens.total ||
+        lastFinished.tokens.input +
+          lastFinished.tokens.output +
+          lastFinished.tokens.cache.read +
+          lastFinished.tokens.cache.write
+      const model = yield* getModel(lastFinished.providerID, lastFinished.modelID, sessionID)
+      const limit = usable({ cfg: yield* config.get(), model, outputTokenMax: flags.outputTokenMax })
+      if (limit === 0 || count < limit * Loop.loopConfig.compactionThreshold) return
+      yield* compaction.create({
+        sessionID,
+        agent: lastFinished.agent,
+        model: { providerID: model.providerID, modelID: model.id },
+        auto: true,
+      })
+      const fresh = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+      const parent = fresh.at(-1)
+      if (parent?.info.role !== "user") return
+      yield* compaction
+        .process({ parentID: parent.info.id, messages: fresh, sessionID, auto: true })
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("proactive cycle compaction failed", {
+              "session.id": sessionID,
+              cause: Cause.pretty(cause),
+            }),
+          ),
+        )
+    })
+
     const loopRun: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.BusyError> =
       Effect.fn("SessionPrompt.loopRun")(function* (input: PromptInput) {
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -1545,6 +1610,10 @@ const layer = Layer.effect(
           input.sessionID,
           lastAssistant(input.sessionID),
           Effect.gen(function* () {
+            yield* maybeCycleCompaction(input.sessionID)
+            // Cycle prompts never carry images; image decoding failures are
+            // unreachable here, so collapsing Image.Error to a defect keeps
+            // the runner's error channel clean.
             yield* createUserMessage(input).pipe(Effect.orDie)
             yield* sessions.touch(input.sessionID)
             return yield* runLoop(input.sessionID)
