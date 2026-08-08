@@ -41,6 +41,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
+import { isRecord } from "@/util/record"
 import {
   Cause,
   Clock,
@@ -93,8 +94,19 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "image/webp",
 ])
 
-const FILE_MODIFY_TOOLS = new Set(["edit", "write", "apply_patch"])
+// Environment-level failures (project directory deleted, model/provider
+// configuration removed) can never self-heal inside a cycle, so they stop
+// the loop immediately instead of burning the consecutive-failure budget.
+const FATAL_ENVIRONMENT_PATTERN = /ProviderModelNotFound|ModelNotFound|realPath|no such file or directory/i
 
+function isFatalEnvironmentError(input: { name?: string | undefined; message?: string | undefined }) {
+  return FATAL_ENVIRONMENT_PATTERN.test(input.name ?? "") || FATAL_ENVIRONMENT_PATTERN.test(input.message ?? "")
+}
+
+function roundErrorMessage(error: NonNullable<SessionV1.Assistant["error"]>) {
+  const data = error.data
+  return isRecord(data) && typeof data.message === "string" ? data.message : error.name
+}
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
 
 IMPORTANT:
@@ -1589,6 +1601,7 @@ mode: "cycle" as const,
       paused: boolean
       consecutiveFailures: number
       consecutiveDry: number
+      consecutiveEmpty: number
       coalescedCount: number
       commandSeq: number
       lastStatus?: "success" | "fail"
@@ -1677,6 +1690,7 @@ mode: "cycle" as const,
               current.commandSeq = persisted.state.commandSeq
               current.paused = persisted.state.paused
               current.consecutiveDry = persisted.state.consecutiveDry
+              current.consecutiveEmpty = persisted.state.consecutiveEmpty
               current.consecutiveFailures = persisted.state.consecutiveFailures
             }
           }
@@ -1794,23 +1808,105 @@ mode: "cycle" as const,
             continue
           }
           current.rounds = round
+          // Shared failure path for thrown round errors and rounds whose
+          // assistant message carries a provider/stream error. Returns true
+          // when the failure budget is exhausted and the cycle auto-stopped.
+          const recordFailure = Effect.fnUntraced(function* (error: string, prompt: string) {
+            const errorMsg = error.slice(0, 200)
+            current.consecutiveFailures++
+            current.lastStatus = "fail"
+            yield* Effect.logError("loop iteration failed", {
+              "session.id": input.sessionID,
+              round,
+              error,
+            })
+            yield* noReply(input.sessionID, undefined, `[${word} #${round}] Iteration failed: ${errorMsg}`)
+            yield* Loop.persistRoundResult(storage, input.sessionID, round, {
+              timestamp: yield* Clock.currentTimeMillis,
+              prompt,
+              status: "fail",
+              response: errorMsg,
+            })
+            if (current.consecutiveFailures >= Loop.loopConfig.maxConsecutiveFailures) {
+              yield* Loop.clearPersistedState(storage, input.sessionID)
+              yield* publishCycleState(input.sessionID, null).pipe(Effect.ignore)
+              yield* noReply(
+                input.sessionID,
+                undefined,
+                `[${word}] Auto-stopped after ${Loop.loopConfig.maxConsecutiveFailures} consecutive failures. Last error: ${errorMsg}`,
+              )
+              return true
+            }
+            return false
+          })
+
           if (exit._tag === "success") {
+            const roundError = exit.result.info.role === "assistant" ? exit.result.info.error : undefined
+            if (roundError) {
+              const message = roundErrorMessage(roundError)
+              if (isFatalEnvironmentError({ name: roundError.name, message })) {
+                yield* Effect.logError("loop environment failure; stopping", {
+                  "session.id": input.sessionID,
+                  error: message,
+                })
+                yield* Loop.clearPersistedState(storage, input.sessionID)
+                yield* publishCycleState(input.sessionID, null).pipe(Effect.ignore)
+                yield* noReply(
+                  input.sessionID,
+                  undefined,
+                  `[${word}] Cycle stopped: environment failure (${message.slice(0, 200)}). Fix the environment and start a new cycle.`,
+                )
+                return
+              }
+              const stopped = yield* recordFailure(message, exit.fullPrompt)
+              if (stopped) return
+              yield* persist
+              yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
+              continue
+            }
+            // A provider that answers with no content and zero tokens is
+            // broken, not done: stop fast instead of drifting through the
+            // dry-iteration budget. Step boundary parts don't count as
+            // content, so check for the absence of visible output parts.
+            const emptyRound =
+              exit.result.info.role === "assistant" &&
+              exit.result.info.tokens.output === 0 &&
+              !exit.result.parts.some(
+                (part) => part.type === "text" || part.type === "reasoning" || part.type === "tool",
+              )
+            if (emptyRound) {
+              current.consecutiveEmpty++
+              yield* Loop.persistRoundResult(storage, input.sessionID, round, {
+                timestamp: yield* Clock.currentTimeMillis,
+                prompt: exit.fullPrompt,
+                status: "fail",
+                response: "Provider returned an empty response (no content, no output tokens)",
+              })
+              if (current.consecutiveEmpty >= Loop.loopConfig.maxEmptyRounds) {
+                yield* Loop.clearPersistedState(storage, input.sessionID)
+                yield* publishCycleState(input.sessionID, null).pipe(Effect.ignore)
+                yield* noReply(
+                  input.sessionID,
+                  undefined,
+                  `[${word}] Auto-stopped after ${current.consecutiveEmpty} consecutive empty responses from the provider.`,
+                )
+                return
+              }
+              yield* noReply(
+                input.sessionID,
+                undefined,
+                `[${word} #${round}] Empty response from provider (${current.consecutiveEmpty}/${Loop.loopConfig.maxEmptyRounds}); the cycle will stop if it continues.`,
+              )
+              yield* persist
+              yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
+              continue
+            }
+            current.consecutiveEmpty = 0
             current.consecutiveFailures = 0
             current.lastStatus = "success"
             const roundMsgs = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
-            const hasFileModification = roundMsgs.some(
-              (msg) =>
-                msg.info.role === "assistant" &&
-                (!exit.boundaryId || msg.info.id > exit.boundaryId) &&
-                msg.parts.some(
-                  (part) =>
-                    part.type === "tool" &&
-                    part.tool !== undefined &&
-                    FILE_MODIFY_TOOLS.has(part.tool) &&
-                    part.state?.status === "completed",
-                ),
-            )
-            if (hasFileModification) {
+            const madeProgress = Loop.roundMadeProgress(roundMsgs, exit.boundaryId)
+            if (madeProgress) {
               current.consecutiveDry = 0
             } else {
               current.consecutiveDry++
@@ -1836,7 +1932,7 @@ mode: "cycle" as const,
                 yield* noReply(
                   input.sessionID,
                   undefined,
-                  `[${word} #${round}] Paused after ${Loop.loopConfig.maxDryIterations} consecutive iterations with no file modifications. Use /cycle resume to continue.`,
+                  `[${word} #${round}] Paused after ${Loop.loopConfig.maxDryIterations} consecutive iterations with no file or VCS changes. Use /cycle resume to continue.`,
                 )
               }
               continue
@@ -1859,31 +1955,23 @@ mode: "cycle" as const,
               response: "Iteration was interrupted",
             })
           } else {
-            current.consecutiveFailures++
-            current.lastStatus = "fail"
-            const errorMsg = Cause.pretty(exit.cause).slice(0, 200)
-            yield* Effect.logError("loop iteration failed", {
-              "session.id": input.sessionID,
-              round,
-              cause: Cause.pretty(exit.cause),
-            })
-            yield* noReply(input.sessionID, undefined, `[${word} #${round}] Iteration failed: ${errorMsg}`)
-            yield* Loop.persistRoundResult(storage, input.sessionID, round, {
-              timestamp: yield* Clock.currentTimeMillis,
-              prompt: buildPrompt(round, current.consecutiveDry, previous),
-              status: "fail",
-              response: errorMsg,
-            })
-            if (current.consecutiveFailures >= Loop.loopConfig.maxConsecutiveFailures) {
+            const pretty = Cause.pretty(exit.cause)
+            if (isFatalEnvironmentError({ message: pretty })) {
+              yield* Effect.logError("loop environment failure; stopping", {
+                "session.id": input.sessionID,
+                error: pretty,
+              })
               yield* Loop.clearPersistedState(storage, input.sessionID)
               yield* publishCycleState(input.sessionID, null).pipe(Effect.ignore)
               yield* noReply(
                 input.sessionID,
                 undefined,
-                `[${word}] Auto-stopped after ${Loop.loopConfig.maxConsecutiveFailures} consecutive failures. Last error: ${errorMsg}`,
+                `[${word}] Cycle stopped: environment failure (${pretty.slice(0, 200)}). Fix the environment and start a new cycle.`,
               )
               return
             }
+            const stopped = yield* recordFailure(pretty, buildPrompt(round, current.consecutiveDry, previous))
+            if (stopped) return
           }
 
           yield* persist
@@ -1926,6 +2014,7 @@ mode: "cycle" as const,
         running: false,
         consecutiveFailures: input.consecutiveFailures,
         consecutiveDry: input.consecutiveDry,
+        consecutiveEmpty: input.consecutiveEmpty,
         coalescedCount: input.coalescedCount,
         lastStatus: input.lastStatus,
         timezone: Loop.timezone(),
@@ -1970,6 +2059,7 @@ mode: "cycle" as const,
         paused: false,
         consecutiveFailures: 0,
         consecutiveDry: 0,
+        consecutiveEmpty: 0,
         coalescedCount: 0,
         commandSeq: 0,
       })
@@ -2192,6 +2282,7 @@ mode: "cycle" as const,
             ...persisted.state,
             paused: false,
             consecutiveDry: 0,
+            consecutiveEmpty: 0,
             consecutiveFailures: 0,
             nextRunAt: now + persisted.state.schedule.intervalMs,
             commandSeq: persisted.state.commandSeq + 1,
@@ -2207,6 +2298,7 @@ mode: "cycle" as const,
         }
         existing.paused = false
         existing.consecutiveDry = 0
+        existing.consecutiveEmpty = 0
         existing.consecutiveFailures = 0
         existing.commandSeq++
         const now = yield* Clock.currentTimeMillis
@@ -2434,6 +2526,7 @@ mode: "cycle" as const,
         paused: persisted.paused,
         consecutiveFailures: persisted.consecutiveFailures,
         consecutiveDry: persisted.consecutiveDry,
+        consecutiveEmpty: persisted.consecutiveEmpty,
         coalescedCount: persisted.coalescedCount,
         commandSeq: persisted.commandSeq,
         lastStatus: persisted.lastStatus,

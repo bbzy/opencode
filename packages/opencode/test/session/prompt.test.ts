@@ -3271,6 +3271,7 @@ it.instance(
         running: false,
         consecutiveFailures: 0,
         consecutiveDry: 0,
+        consecutiveEmpty: 0,
         coalescedCount: 0,
         timezone: "local",
         commandSeq: 0,
@@ -3317,6 +3318,7 @@ const foreignLoopState = (now: number): Loop.SerializedLoopState => ({
   running: false,
   consecutiveFailures: 0,
   consecutiveDry: 0,
+  consecutiveEmpty: 0,
   coalescedCount: 0,
   timezone: "local",
   owner: { id: "other-process", at: now },
@@ -3496,6 +3498,45 @@ it.instance(
         expect(text.text).toContain("duplicate delivery")
         expect(text.text).toContain("DONE")
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "cycle auto-stops after consecutive empty provider responses",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        const storage = yield* Storage.Service
+        // Finish "stop" with no content and zero tokens: the provider is
+        // broken, so the cycle must stop fast instead of pausing on dry.
+        // Two replies, one per round — the queue is consumed per request.
+        yield* llm.push(reply().stop(), reply().stop())
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const stateMap = yield* prompt.loopState()
+            return stateMap[chat.id] === undefined ? (true as const) : undefined
+          }),
+          "cycle never auto-stopped after empty responses",
+          "10 seconds",
+        )
+        expect((yield* Loop.readPersistedState(storage, chat.id)).type).toBe("missing")
+        const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+        const stopMsg = msgs.find(
+          (msg) =>
+            msg.info.role === "user" &&
+            msg.parts.some((part) => part.type === "text" && part.text.includes("empty responses")),
+        )
+        expect(stopMsg).toBeDefined()
       } finally {
         loopConfig.minIntervalMs = originalMin
       }
