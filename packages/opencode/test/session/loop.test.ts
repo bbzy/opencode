@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test"
-import { Schema } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Loop } from "@/session/loop"
 
@@ -73,12 +72,33 @@ describe("session cycle scheduling", () => {
   test("roundMadeProgress counts file-modifying tools and VCS mutations only", () => {
     expect(Loop.roundMadeProgress(round(toolPart({ tool: "edit", status: "completed" })), "m1")).toBe(true)
     expect(Loop.roundMadeProgress(round(toolPart({ tool: "edit", status: "error" })), "m1")).toBe(false)
-    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "jj split src/x.ts" })), "m1")).toBe(true)
-    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "git commit -m x" })), "m1")).toBe(true)
-    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "jj bookmark move main abc" })), "m1")).toBe(true)
-    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "jj st" })), "m1")).toBe(false)
-    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "git status && jj log" })), "m1")).toBe(false)
-    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "jj bookmark list" })), "m1")).toBe(false)
+    expect(
+      Loop.roundMadeProgress(
+        round(toolPart({ tool: "bash", status: "completed", command: "jj split src/x.ts" })),
+        "m1",
+      ),
+    ).toBe(true)
+    expect(
+      Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "git commit -m x" })), "m1"),
+    ).toBe(true)
+    expect(
+      Loop.roundMadeProgress(
+        round(toolPart({ tool: "bash", status: "completed", command: "jj bookmark move main abc" })),
+        "m1",
+      ),
+    ).toBe(true)
+    expect(Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "jj st" })), "m1")).toBe(
+      false,
+    )
+    expect(
+      Loop.roundMadeProgress(
+        round(toolPart({ tool: "bash", status: "completed", command: "git status && jj log" })),
+        "m1",
+      ),
+    ).toBe(false)
+    expect(
+      Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "jj bookmark list" })), "m1"),
+    ).toBe(false)
     expect(Loop.roundMadeProgress(round(toolPart({ tool: "read", status: "completed" })), "m1")).toBe(false)
   })
 
@@ -87,27 +107,5 @@ describe("session cycle scheduling", () => {
     expect(Loop.roundMadeProgress(messages, "m1")).toBe(true)
     expect(Loop.roundMadeProgress(messages, "m2")).toBe(false)
     expect(Loop.roundMadeProgress(messages, undefined)).toBe(true)
-  })
-
-  test("round-trips a persisted cycle state", () => {
-    const state: Loop.SerializedLoopState = {
-      version: 1,
-      intervalStr: "every 3m",
-      schedule: { type: "cycle", intervalMs: 180_000 },
-      rounds: 4,
-      startedAt: 1_000_000,
-      nextRunAt: 1_180_000,
-      paused: false,
-      pending: false,
-      running: false,
-      consecutiveFailures: 0,
-      consecutiveDry: 1,
-      consecutiveEmpty: 0,
-      coalescedCount: 2,
-      timezone: "local",
-      commandSeq: 0,
-    }
-    const decoded = Schema.decodeUnknownSync(Loop.SerializedLoopState)(state)
-    expect(decoded).toEqual(state)
   })
 })
