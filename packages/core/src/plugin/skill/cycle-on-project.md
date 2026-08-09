@@ -39,7 +39,7 @@ Think of yourself as a developer who has been assigned ownership of a specific a
 4. **Organize commits and commit automatically.** Group this cycle's related changes logically, write a clear commit message for each group, then commit with the detected VCS without asking for confirmation. Don't leave changes uncommitted at the end of a cycle. In a jj repo, also tidy the **entire current branch's commit history** — not just this cycle's changes — by splitting over-broad commits, squashing fragmented ones, reordering for logical flow, and rewording unclear messages; jj history is mutable by design.
 5. **Don't ask what you can look up.** Before asking the user anything, exhaust self-service channels: read the code, check config, run tests, inspect git history.
 6. **The session is unattended — never end a turn waiting for an answer.** Blocking questions ("which option should I pick?", "please confirm these 6 items") are never answered; they just stall the loop and get parroted round after round. Decide objective questions yourself. For genuinely subjective choices, pick a reasonable default, proceed, and note the decision in your report as something the user may want to revisit — that is information, not a question.
-7. **A fix is not done until it is verified.** Never commit or report a fix without running the strongest available check — full build, targeted test, or at minimum a syntax/type check of the touched files. If the project has no quick verification path, invest one round in creating one (a scratch syntax-check script is fine) before piling up unverified fixes.
+7. **A fix is not done until it is verified.** Never commit or report a fix without running the strongest available check — full build, targeted test, or at minimum a syntax/type check of the touched files. If the project has no quick verification path, invest one round in creating one (a scratch syntax-check script is fine) before piling up unverified fixes. Marking a verification task completed when the check never ran or never passed is a false report — worse than having no task at all.
 8. **Serialize VCS operations and edits.** jj snapshots the working copy on every command, so interleaving edits with jj/git commands on the same files produces lost changes, phantom conflicts, and history surgery. Finish the edits for a logical unit first, then run VCS commands one at a time and check `jj st` (or `git status`) after each before continuing. If the history does get tangled, stop editing and repair it before anything else.
 
 ## Entry — Establish Scope and Baseline
@@ -113,7 +113,8 @@ A round prompt (`[Cycle #N] Automated cycle — iteration N. ...`) is the schedu
 Round prompts may carry extra context lines:
 
 - **Last completed iteration** — the tail of your own previous round report. Use it as ground truth for where the loop stands; do not re-verify work it says was done.
-- **Idle status** — how many consecutive rounds had no file or VCS changes, and the auto-pause threshold. Rounds with no completed `edit`/`write`/`apply_patch` and no VCS mutations (commit/split/squash/rebase/describe etc.) count as idle, and enough consecutive idle rounds auto-pause the cycle — so a round whose only output is status checks (`jj st`, `git status`, re-running a green build) burns the budget and brings the pause closer. If work is genuinely done, say DONE with a one-line reason instead of manufacturing status-check rounds; the user can stop the cycle, and honesty beats busy-work.
+- **Idle status** — how many consecutive rounds had no file or VCS changes, and the auto-pause threshold. Rounds with no completed `edit`/`write`/`apply_patch` and no VCS mutations (commit/split/squash/rebase/describe etc.) count as idle, and enough consecutive idle rounds auto-pause the cycle — so a round whose only output is status checks (`jj st`, `git status`, re-running a green build) burns the budget and brings the pause closer. If work is genuinely done — and only then, see the DONE bar in Termination — say DONE with a one-line reason instead of manufacturing status-check rounds; the user can stop the cycle, and honesty beats busy-work.
+- **Unfinished todos** — the session todo list's pending/in-progress items, when any exist. This is your own backlog talking back to you: resolve every item or explicitly close it with a one-line reason before the turn ends. A DONE that contradicts a dirty todo list is not DONE.
 - **Duplicate-delivery note** — the scheduler deduplicates rounds, but if a prompt names an iteration you already completed, treat it as a duplicate: confirm briefly and end the turn without redoing anything. Never invent your own iteration numbering — trust the `[Cycle #N]` in the prompt over your memory of "which cycle this is".
 
 ### Phase 1 — Do Tasks
@@ -205,6 +206,8 @@ With no user-defined scope, generate candidates within the current expansion fro
 
 Record the candidates and the chosen one (with a one-line reason for the pick) in session state, briefly tell the user what you'll do next and why, then return to Phase 1. The user can interrupt at any time with a different task or stop the loop; you don't need to offer a menu to enable that.
 
+DONE is not a substitute for this phase. Declaring DONE without producing the candidate list is the task-execution-machine failure mode this skill exists to prevent: an owner who actually surveyed their area can always name what they would improve next, even when they judge none of it worth a round.
+
 ## Mid-Loop User Instructions
 
 The user can interrupt the loop at any time with a new instruction. When this happens:
@@ -227,7 +230,13 @@ When stopping:
 4. If the user said stop in chat but the scheduler may still be active, remind them once to run `/cycle stop` — otherwise round prompts will keep waking you. You cannot run it yourself.
 5. Exit loop mode.
 
-Never self-terminate. Even if you think there's "nothing left to do," the Plan phase should always propose something — there's always technical debt, always a test that could be more thorough, always documentation that could be clearer. But stay honest about value: if the scope is genuinely in good shape and the only "work" left is re-running green checks and re-reading clean diffs, report DONE with a one-line justification and end the turn. Idle status-check rounds count toward the scheduler's auto-pause threshold anyway, so an honest DONE is strictly better than manufactured busy-work — the loop stays alive for the user to redirect, and you lose nothing.
+Never self-terminate. Even if you think there's "nothing left to do," the Plan phase should always propose something — there's always technical debt, always a test that could be more thorough, always documentation that could be clearer. But stay honest about value: DONE is a verdict you must be able to defend, not a way to clock out. DONE is only legal when all three hold:
+
+1. **The todo list is clean** — no pending or in-progress items; every entry is completed (with its goal actually achieved) or explicitly closed with a one-line reason.
+2. **Every fix made during the loop is verified** — each committed change passed the strongest available check (Ironclad Rule 7). If verification is blocked, the loop's next work is building a verification path, not DONE.
+3. **This cycle's Plan phase ran and produced its candidate list** — and every candidate was rejected with a one-line reason recorded in session state.
+
+When all three hold and the only "work" left is re-running green checks and re-reading clean diffs, report DONE with a one-line justification and end the turn. Otherwise continue the loop: close out the todos, build the missing verification path, or execute the chosen candidate. Idle status-check rounds count toward the scheduler's auto-pause threshold anyway, so an honest DONE is strictly better than manufactured busy-work — the loop stays alive for the user to redirect, and you lose nothing.
 
 ## Compaction Resilience
 
