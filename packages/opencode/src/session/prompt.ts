@@ -1644,6 +1644,8 @@ const layer = Layer.effect(
                 consecutiveDry: state.consecutiveDry,
                 coalescedCount: state.coalescedCount,
                 lastStatus: state.lastStatus,
+                resetInterval: state.resetInterval,
+                roundsSinceReset: state.roundsSinceReset,
               },
             }
           : {}),
@@ -1655,12 +1657,18 @@ const layer = Layer.effect(
       schedule: Loop.ScheduleInfo
       nextRunAt: number
       startedAt: number
+      resetInterval: number
     }) {
       const queue = yield* Queue.dropping<"scheduled" | "explicit">(1)
       const runtime: { state?: Loop.LoopState } = {}
       const word = "Cycle"
-      const buildPrompt = (round: number, consecutiveDry: number, previous?: { round: number; summary: string }) =>
-        Loop.buildCyclePrompt(round, { consecutiveDry, previous })
+      const buildPrompt = (
+        round: number,
+        consecutiveDry: number,
+        previous: { round: number; summary: string } | undefined,
+        resetAfter: boolean,
+        handoff: string | undefined,
+      ) => Loop.buildCyclePrompt(round, { consecutiveDry, previous, resetAfter, handoff })
       // Last busy→idle transition for this session; drives the cycle mode's
       // idle-anchored schedule. Bootstrapped to the fiber start so a cycle
       // started on a long-idle session fires on time.
@@ -1777,8 +1785,10 @@ const layer = Layer.effect(
 
           const round = current.rounds + 1
           const previous = current.lastRoundResult
+          const handoff = current.handoff
+          const resetAfter = current.resetInterval > 0 && current.roundsSinceReset + 1 >= current.resetInterval
           const exit = yield* Effect.gen(function* () {
-            const fullPrompt = buildPrompt(round, current.consecutiveDry, previous)
+            const fullPrompt = buildPrompt(round, current.consecutiveDry, previous, resetAfter, handoff)
             const before = yield* sessions.messages({ sessionID: input.sessionID, limit: 1 }).pipe(Effect.orDie)
             const boundaryId = before[0]?.info.id
             const result = yield* loopRun({
@@ -1913,6 +1923,28 @@ const layer = Layer.effect(
               .join("\n")
               .slice(0, 5000)
             current.lastRoundResult = { round, summary: response.replace(/\s+/g, " ").trim().slice(-300) }
+            if (handoff) current.handoff = undefined
+            if (current.resetInterval > 0) {
+              current.roundsSinceReset++
+            }
+            if (current.resetInterval > 0 && current.roundsSinceReset >= current.resetInterval) {
+              const handoffText = exit.result.parts
+                .filter((part): part is SessionV1.TextPart => part.type === "text")
+                .map((part) => part.text)
+                .join("\n")
+                .slice(0, Loop.loopConfig.handoffMaxLength)
+              if (handoffText.trim()) current.handoff = handoffText
+              const allMsgs = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+              for (const msg of allMsgs) {
+                yield* sessions.removeMessage({ sessionID: input.sessionID, messageID: msg.info.id })
+              }
+              current.roundsSinceReset = 0
+              yield* noReply(
+                input.sessionID,
+                undefined,
+                `[${word} #${round}] Session reset: history cleared, handoff stored for the next iteration.`,
+              )
+            }
             if (current.consecutiveDry >= Loop.loopConfig.maxDryIterations) {
               const announce = !current.paused
               current.paused = true
@@ -1996,6 +2028,8 @@ const layer = Layer.effect(
         consecutiveEmpty: 0,
         coalescedCount: 0,
         timezone: Loop.timezone(),
+        resetInterval: input.resetInterval,
+        roundsSinceReset: 0,
       }
       runtime.state = loopState
       activeCycles.set(input.sessionID, loopState)
@@ -2011,6 +2045,7 @@ const layer = Layer.effect(
       startedAt: number
       announce?: boolean
       messageID?: MessageID
+      resetInterval: number
     }) {
       const existing = activeCycles.get(input.sessionID)
       if (existing) {
@@ -2029,6 +2064,7 @@ const layer = Layer.effect(
         schedule: input.schedule,
         nextRunAt: input.nextRunAt,
         startedAt: input.startedAt,
+        resetInterval: input.resetInterval,
       })
       return { text, message }
     })
@@ -2047,11 +2083,13 @@ const layer = Layer.effect(
         "  pause    Temporarily pause the cycle (preserves round count)",
         "  resume   Resume a paused cycle",
         "  run      Force the next cycle iteration now instead of waiting",
+        "  reset    Manually reset the session (clear history, store handoff)",
         "  status   Show the current cycle status",
         "",
         "Start syntax:",
-        "  /cycle [start] <interval>",
+        "  /cycle [start] <interval> [--reset N]",
         "  Starting a new cycle replaces the active one.",
+        "  --reset N: reset session history every N rounds (0 = disabled, default 0)",
         "",
         `Minimum interval: ${Loop.loopConfig.minIntervalMs / 1000}s`,
         `Auto-stops after ${Loop.loopConfig.maxConsecutiveFailures} consecutive failures`,
@@ -2059,11 +2097,13 @@ const layer = Layer.effect(
         "",
         "Examples:",
         "  /cycle 5m",
+        "  /cycle 5m --reset 10",
         "  /cycle stop",
         "  /cycle pause",
         "  /cycle resume",
         "  /cycle status",
         "  /cycle run",
+        "  /cycle reset",
         "",
         "Intervals: ms, s, m, h (e.g. 30s, 5m, 1h, 2h30m)",
         "Cycles are idle-anchored: each iteration starts <interval> after the",
@@ -2111,8 +2151,22 @@ const layer = Layer.effect(
         intervalStr = `every ${intervalStrRaw}`
         nextRunAt = now + intervalMs
 
+        let resetInterval = 0
         for (let index = 1; index < values.length; index++) {
           const value = values[index]
+          if (value === "--reset" || value === "-r") {
+            const resetValue = Number(values[index + 1])
+            if (!Number.isInteger(resetValue) || resetValue < 0) {
+              return yield* noReply(
+                input.sessionID,
+                input.messageID,
+                `Invalid reset interval: "${values[index + 1] ?? ""}". Must be a non-negative integer.`,
+              )
+            }
+            resetInterval = resetValue
+            index++
+            continue
+          }
           return yield* noReply(input.sessionID, input.messageID, `Unexpected argument: "${value}".\n\n${usageText}`)
         }
 
@@ -2124,6 +2178,7 @@ const layer = Layer.effect(
           startedAt: now,
           announce: true,
           messageID: input.messageID,
+          resetInterval,
         })
         return result.message ?? (yield* noReply(input.sessionID, input.messageID, result.text))
       }
@@ -2159,6 +2214,8 @@ const layer = Layer.effect(
           if (existing.consecutiveFailures > 0) parts.push(`${existing.consecutiveFailures} consecutive failures`)
           if (existing.consecutiveDry > 0)
             parts.push(`${existing.consecutiveDry}/${Loop.loopConfig.maxDryIterations} consecutive idle iterations`)
+          if (existing.resetInterval > 0)
+            parts.push(`${existing.roundsSinceReset}/${existing.resetInterval} rounds since last reset`)
           if (existing.coalescedCount > 0) parts.push(`${existing.coalescedCount} ticks coalesced`)
           return yield* noReply(
             input.sessionID,
@@ -2229,6 +2286,41 @@ const layer = Layer.effect(
           )
         }
         return yield* noReply(input.sessionID, input.messageID, `Cycle triggered: next run starting now.`)
+      }
+
+      if (subcommand === "reset") {
+        const existing = activeCycles.get(input.sessionID)
+        if (!existing) return yield* noReply(input.sessionID, input.messageID, `No active cycle for this session.`)
+        const st = yield* status
+          .get(input.sessionID)
+          .pipe(Effect.catchCause(() => Effect.succeed({ type: "idle" as const })))
+        if (st.type === "busy" || existing.running) {
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            `Session is busy; wait for the current iteration to finish before resetting.`,
+          )
+        }
+        const allMsgs = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+        const lastAssistant = [...allMsgs].reverse().find((msg) => msg.info.role === "assistant")
+        if (lastAssistant) {
+          const handoffText = lastAssistant.parts
+            .filter((part): part is SessionV1.TextPart => part.type === "text")
+            .map((part) => part.text)
+            .join("\n")
+            .slice(0, Loop.loopConfig.handoffMaxLength)
+          if (handoffText.trim()) existing.handoff = handoffText
+        }
+        for (const msg of allMsgs) {
+          yield* sessions.removeMessage({ sessionID: input.sessionID, messageID: msg.info.id })
+        }
+        existing.roundsSinceReset = 0
+        yield* publishCycleState(input.sessionID, existing).pipe(Effect.ignore)
+        return yield* noReply(
+          input.sessionID,
+          input.messageID,
+          `Session reset: history cleared (${allMsgs.length} messages removed). ${existing.rounds} rounds completed, rounds-since-reset cleared. Handoff stored for the next iteration.`,
+        )
       }
 
       if (!subcommand || subcommand === "help") {
@@ -2382,6 +2474,8 @@ const layer = Layer.effect(
           consecutiveDry: state.consecutiveDry,
           coalescedCount: state.coalescedCount,
           lastStatus: state.lastStatus,
+          resetInterval: state.resetInterval,
+          roundsSinceReset: state.roundsSinceReset,
         }
       }
       return result
