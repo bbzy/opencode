@@ -116,6 +116,7 @@ export function buildCyclePrompt(
     previous?: { round: number; summary: string }
     resetAfter?: boolean
     handoff?: string
+    pendingTodos?: readonly string[]
   },
 ) {
   const now = new Date()
@@ -141,11 +142,20 @@ export function buildCyclePrompt(
       `⚠ This is the last iteration before a session reset. After you complete this iteration, the conversation history will be cleared to free context. Write a handoff summary for the next iteration's agent — describe the current state, what has been accomplished, and what remains to be done. The handoff will be included in the next iteration's prompt after the reset.`,
     )
   }
+  if (context?.pendingTodos && context.pendingTodos.length > 0) {
+    const todos = context.pendingTodos.slice(0, 10).map((content) => `"${content.slice(0, 120)}"`)
+    lines.push(
+      `Unfinished todos (${context.pendingTodos.length}): ${todos.join(", ")}. Resolve them or explicitly close them before declaring DONE.`,
+    )
+  }
   lines.push(
     `If you already completed iteration ${round} or later, treat this as a duplicate delivery: confirm briefly without redoing work.`,
   )
   lines.push(
     `If no meaningful work remains, say DONE with a one-line reason instead of running status-check-only rounds.`,
+  )
+  lines.push(
+    `Say DONE only when no unfinished todos remain, every committed fix is verified, and this cycle's Plan phase produced no viable candidate — then report DONE with a one-line reason instead of running status-check-only rounds.`,
   )
   return lines.join("\n")
 }

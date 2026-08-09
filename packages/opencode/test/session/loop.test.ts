@@ -65,8 +65,23 @@ describe("session cycle scheduling", () => {
     const prompt = Loop.buildCyclePrompt(1, { consecutiveDry: 0 })
     expect(prompt).not.toContain("Last completed iteration")
     expect(prompt).not.toContain("Idle status")
+    expect(prompt).not.toContain("Unfinished todos")
     expect(prompt).toContain("duplicate delivery")
     expect(prompt).toContain("DONE")
+  })
+
+  test("cycle round prompts list unfinished todos and gate the DONE exit", () => {
+    const prompt = Loop.buildCyclePrompt(2, {
+      consecutiveDry: 0,
+      pendingTodos: ["Verify the build compiles", "Sync the fix to the reference demo"],
+    })
+    expect(prompt).toContain('Unfinished todos (2): "Verify the build compiles", "Sync the fix to the reference demo"')
+    expect(prompt).toContain("before declaring DONE")
+    expect(prompt).toContain("no unfinished todos remain")
+  })
+
+  test("cycle round prompts omit the todos line when none are pending", () => {
+    expect(Loop.buildCyclePrompt(2, { consecutiveDry: 0, pendingTodos: [] })).not.toContain("Unfinished todos")
   })
 
   test("roundMadeProgress counts file-modifying tools and VCS mutations only", () => {

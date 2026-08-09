@@ -73,6 +73,7 @@ import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
+import { Todo } from "./todo"
 import { Loop } from "./loop"
 import { LoopEvent } from "@opencode-ai/schema/loop-event"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
@@ -186,6 +187,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const todo = yield* Todo.Service
     const { db } = database
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
@@ -1668,7 +1670,8 @@ const layer = Layer.effect(
         previous: { round: number; summary: string } | undefined,
         resetAfter: boolean,
         handoff: string | undefined,
-      ) => Loop.buildCyclePrompt(round, { consecutiveDry, previous, resetAfter, handoff })
+        pendingTodos: readonly string[] = [],
+      ) => Loop.buildCyclePrompt(round, { consecutiveDry, previous, resetAfter, handoff, pendingTodos })
       // Last busy→idle transition for this session; drives the cycle mode's
       // idle-anchored schedule. Bootstrapped to the fiber start so a cycle
       // started on a long-idle session fires on time.
@@ -1787,8 +1790,13 @@ const layer = Layer.effect(
           const previous = current.lastRoundResult
           const handoff = current.handoff
           const resetAfter = current.resetInterval > 0 && current.roundsSinceReset + 1 >= current.resetInterval
+          // Surface the session's unfinished todos in the round prompt so a
+          // DONE verdict has to reckon with its own backlog.
+          const pendingTodos = (yield* todo.get(input.sessionID))
+            .filter((item) => item.status !== "completed" && item.status !== "cancelled")
+            .map((item) => item.content)
           const exit = yield* Effect.gen(function* () {
-            const fullPrompt = buildPrompt(round, current.consecutiveDry, previous, resetAfter, handoff)
+            const fullPrompt = buildPrompt(round, current.consecutiveDry, previous, resetAfter, handoff, pendingTodos)
             const before = yield* sessions.messages({ sessionID: input.sessionID, limit: 1 }).pipe(Effect.orDie)
             const boundaryId = before[0]?.info.id
             const result = yield* loopRun({
@@ -1955,7 +1963,7 @@ const layer = Layer.effect(
                 yield* noReply(
                   input.sessionID,
                   undefined,
-                  `[${word} #${round}] Paused after ${Loop.loopConfig.maxDryIterations} consecutive iterations with no file or VCS changes. Use /cycle resume to continue.`,
+                  `[${word} #${round}] Auto-paused: the last ${Loop.loopConfig.maxDryIterations} iterations completed without file or VCS changes. Use /cycle resume to continue.`,
                 )
               }
               continue
@@ -2630,6 +2638,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    Todo.node,
   ],
 })
 
