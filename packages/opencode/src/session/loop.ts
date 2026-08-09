@@ -14,7 +14,9 @@ export const loopConfig = {
   // history no longer fits and fails — compacting earlier keeps that path
   // from ever running.
   compactionThreshold: 0.7,
-  maxResults: 100,
+  // Maximum chars of the last assistant response to keep as the handoff
+  // text when a session reset occurs.
+  handoffMaxLength: 10_000,
 }
 
 export const FILE_MODIFY_TOOLS = new Set(["edit", "write", "apply_patch"])
@@ -73,7 +75,10 @@ export type LoopState = {
   coalescedCount: number
   lastStatus?: "success" | "fail"
   timezone: string
+  resetInterval: number
+  roundsSinceReset: number
   lastRoundResult?: { round: number; summary: string }
+  handoff?: string
   fiber: Fiber.Fiber<void, unknown>
   trigger: (opts?: { queueWhenBusy?: boolean }) => Effect.Effect<void>
 }
@@ -109,18 +114,31 @@ export function buildCyclePrompt(
   context?: {
     consecutiveDry: number
     previous?: { round: number; summary: string }
-    },
+    resetAfter?: boolean
+    handoff?: string
+  },
 ) {
   const now = new Date()
   const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`
   const time = now.toTimeString().slice(0, 5)
   const lines = [`[Cycle #${round}] Automated cycle — iteration ${round}. ${date} ${time}.`]
+  if (context?.handoff) {
+    lines.push(
+      `Session was reset after the previous iteration. Here is the handoff from the previous agent:`,
+      context.handoff,
+    )
+  }
   if (context?.previous) {
     lines.push(`Last completed iteration: #${context.previous.round} — ${context.previous.summary}`)
   }
   if (context && context.consecutiveDry > 0) {
     lines.push(
       `Idle status: ${context.consecutiveDry}/${loopConfig.maxDryIterations} consecutive iterations without file or VCS changes; the cycle auto-pauses at ${loopConfig.maxDryIterations}.`,
+    )
+  }
+  if (context?.resetAfter) {
+    lines.push(
+      `⚠ This is the last iteration before a session reset. After you complete this iteration, the conversation history will be cleared to free context. Write a handoff summary for the next iteration's agent — describe the current state, what has been accomplished, and what remains to be done. The handoff will be included in the next iteration's prompt after the reset.`,
     )
   }
   lines.push(
