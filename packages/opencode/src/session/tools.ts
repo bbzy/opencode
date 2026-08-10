@@ -46,6 +46,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
+  unattended?: boolean
 }) {
   const tools: Record<string, AITool> = {}
   const run = yield* EffectBridge.make()
@@ -78,15 +79,16 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           },
         }
       }),
-    ask: (req) =>
-      permission
-        .ask({
-          ...req,
-          sessionID: input.session.id,
-          tool: { messageID: input.processor.message.id, callID: options.toolCallId },
-          ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
-        })
-        .pipe(Effect.orDie),
+    ask: (req) => {
+      const effect = permission.ask({
+        ...req,
+        sessionID: input.session.id,
+        tool: { messageID: input.processor.message.id, callID: options.toolCallId },
+        ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
+        unattended: input.unattended,
+      })
+      return effect.pipe(Effect.orDie)
+    },
   })
 
   for (const item of yield* registry.tools({

@@ -9,8 +9,12 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 
 export const Event = PermissionV1.Event
 
+type AskInput = PermissionV1.AskInput & {
+  unattended?: boolean
+}
+
 export interface Interface {
-  readonly ask: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.Error>
+  readonly ask: (input: AskInput) => Effect.Effect<void, PermissionV1.Error>
   readonly reply: (input: PermissionV1.ReplyInput) => Effect.Effect<void, PermissionV1.NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
 }
@@ -71,9 +75,9 @@ const layer = Layer.effect(
       }),
     )
 
-    const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
+    const ask = Effect.fn("Permission.ask")(function* (input: AskInput) {
       const { approved, pending } = yield* InstanceState.get(state)
-      const { ruleset, ...request } = input
+      const { ruleset, unattended, ...request } = input
       let needsAsk = false
 
       for (const pattern of request.patterns) {
@@ -89,6 +93,11 @@ const layer = Layer.effect(
       }
 
       if (!needsAsk) return
+      if (unattended) {
+        return yield* new PermissionV1.DeniedError({
+          ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
+        })
+      }
 
       const questionRule = evaluate("question", "*", ruleset, approved)
       if (questionRule.action === "deny") {
@@ -114,7 +123,9 @@ const layer = Layer.effect(
       yield* events.publish(Event.Asked, info)
       return yield* Deferred.await(deferred).pipe(
         Effect.onExit(
-          Effect.fnUntraced(function* (exit: Exit.Exit<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>) {
+          Effect.fnUntraced(function* (
+            exit: Exit.Exit<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>,
+          ) {
             const removed = pending.delete(id)
             // Interruption (turn aborted, instance disposed) otherwise removes the
             // pending entry silently; clients only clear the permission UI on
