@@ -6,7 +6,7 @@
 
 # Cycle on Project Mode
 
-Agent-driven, continuous-improvement loop carried by opencode's built-in `/cycle` scheduler. The agent acts as the **responsible owner** of a scope — one the user defined, or the whole project reached by expanding outward from the freshest work — not a passive instruction-follower waiting for the next command, but someone who takes ownership of their area, proactively finds problems, fixes them, verifies the fixes, reflects on whether the work is good enough, and then thinks about what else would make the area better. The loop never self-terminates; it runs until the user says to stop.
+Agent-driven, continuous-improvement loop carried by opencode's built-in `/cycle` scheduler. The agent acts as the **responsible owner** of a scope — one the user defined, or the whole project reached by expanding outward from the freshest work — not a passive instruction-follower waiting for the next command, but someone who takes ownership of their area, proactively finds problems, fixes them, verifies the fixes, reflects on whether the work is good enough, and then thinks about what else would make the area better. The cycle remains registered until the user stops it, but the scheduler may pause after confirmed exhaustion or an external block.
 
 All loop state — scope definition, current phase, current task, accumulated decisions, reflection conclusions, and planned task backlog — lives in **session state** (the conversation context). Because this skill's `name` + `description` persist in the system prompt across context compaction, the full workflow can be reloaded via the `skill` tool if a compaction occurs mid-loop.
 
@@ -33,7 +33,7 @@ Think of yourself as a developer who has been assigned ownership of a specific a
 
 ## Ironclad Rules
 
-1. **The loop never stops itself.** It runs across turns through Do → Check → Reflect → Plan → Do → ..., carried by the `/cycle` scheduler, until the user explicitly says to stop or runs `/cycle stop`. Within a turn, keep working until the current phase's work is done, report briefly, and end the turn — the scheduler wakes you for the next round. Never ask "should I continue?" — just keep going.
+1. **The loop never removes itself.** It runs across turns through Do → Check → Reflect → Plan → Do → ..., carried by the `/cycle` scheduler, until the user explicitly says to stop or runs `/cycle stop`. Within a turn, keep working until the current phase's work is done, report briefly, and end the turn. When the strict DONE bar is met, emit the structured outcome so the scheduler can confirm it and pause without discarding loop state. Never ask "should I continue?" during active work.
 2. **Stay within scope.** Only modify files, branches, and modules within the current scope — the one the user defined, or the expansion frontier reached so far when they didn't. If a task requires touching something outside a user-defined scope, note it as a suggestion and skip that part (or pick a different task) — don't expand a user-defined scope unilaterally, and don't ask; continue with in-scope work.
 3. **Pick your own next task.** In the Plan phase, generate candidate tasks, evaluate their priority yourself, and start the highest-value one. Don't ask the user to choose between tasks. The user can always interrupt with a specific task (see Mid-Loop User Instructions) or stop the loop; you don't need to offer a menu to enable that.
 4. **Organize commits and commit automatically.** Group this cycle's related changes logically, write a clear commit message for each group, then commit with the detected VCS without asking for confirmation. Don't leave changes uncommitted at the end of a cycle. In a jj repo, also tidy the **entire current branch's commit history** — not just this cycle's changes — by splitting over-broad commits, squashing fragmented ones, reordering for logical flow, and rewording unclear messages; jj history is mutable by design.
@@ -113,7 +113,7 @@ A round prompt (`[Cycle #N] Automated cycle — iteration N. ...`) is the schedu
 Round prompts may carry extra context lines:
 
 - **Last completed iteration** — the tail of your own previous round report. Use it as ground truth for where the loop stands; do not re-verify work it says was done.
-- **Idle status** — how many consecutive rounds had no file or VCS changes, and the auto-pause threshold. Rounds with no completed `edit`/`write`/`apply_patch` and no VCS mutations (commit/split/squash/rebase/describe etc.) count as idle, and enough consecutive idle rounds auto-pause the cycle — so a round whose only output is status checks (`jj st`, `git status`, re-running a green build) burns the budget and brings the pause closer. If work is genuinely done — and only then, see the DONE bar in Termination — say DONE with a one-line reason instead of manufacturing status-check rounds; the user can stop the cycle, and honesty beats busy-work.
+- **Idle status** — how many consecutive rounds produced neither durable changes nor new validation evidence before the scheduler challenges the loop's depth. At the threshold, the next round explicitly challenges you to run Reflect; if that round also produces no work, subsequent rounds escalate to Plan. Plan gets a bounded number of dry rounds: widen your view, generate higher-level candidates, and select one yourself. If that audit still finds no viable work, report the structured exhausted or blocked outcome described under Termination; the scheduler pauses after confirmation. A new successful validation command is evidence once, but repeating the same green check is idle.
 - **Unfinished todos** — the session todo list's pending/in-progress items, when any exist. This is your own backlog talking back to you: resolve every item or explicitly close it with a one-line reason before the turn ends. A DONE that contradicts a dirty todo list is not DONE.
 - **Duplicate-delivery note** — the scheduler deduplicates rounds, but if a prompt names an iteration you already completed, treat it as a duplicate: confirm briefly and end the turn without redoing anything. Never invent your own iteration numbering — trust the `[Cycle #N]` in the prompt over your memory of "which cycle this is".
 
@@ -165,9 +165,9 @@ Reflection is what separates a responsible owner from a task-execution machine. 
 Reflect on these dimensions:
 
 1. **Task quality.** Was the task done well? Not just "does it work" — is the design sound? Is the code clean? Is it maintainable? Would you be proud to show this to another engineer?
-2. **Test coverage.** Think beyond "did I write tests." Are the *right* things tested? Are there scenarios you didn't think of during implementation that surfaced during review? Is the coverage honest, or are there disguised gaps?
+2. **Test coverage.** Think beyond "did I write tests." Are the _right_ things tested? Are there scenarios you didn't think of during implementation that surfaced during review? Is the coverage honest, or are there disguised gaps?
 3. **Process.** Was your approach efficient? Did you make assumptions that turned out wrong? Did you go down a dead end? What would you do differently next time?
-4. **Commit organization.** Are this cycle's changes grouped logically? Do the commit messages accurately describe *why*, not just *what*? Would someone reading the version history understand the story? If not, fix it in the next Check pass.
+4. **Commit organization.** Are this cycle's changes grouped logically? Do the commit messages accurately describe _why_, not just _what_? Would someone reading the version history understand the story? If not, fix it in the next Check pass.
 5. **Scope health.** Looking at the scope as a whole — not just this task — is there anything that deteriorated? Technical debt accumulating? Tests getting flaky? Documentation drifting from reality?
 
 Record reflection conclusions in session state. Each conclusion should be actionable — not "tests could be better" but "the error path for expired tokens has no test, and the mock setup in test_auth.ts should be extended to cover it."
@@ -220,7 +220,7 @@ If the user's instruction is to stop the loop, stop. Don't argue, don't ask "are
 
 ## Termination
 
-The loop ends **only** when the user says to stop or runs `/cycle stop`.
+The loop is removed **only** when the user says to stop or runs `/cycle stop`. It may auto-pause when work is demonstrably exhausted or externally blocked; `/cycle resume` continues the same loop after the user redirects it or external conditions change.
 
 When stopping:
 
@@ -230,13 +230,13 @@ When stopping:
 4. If the user said stop in chat but the scheduler may still be active, remind them once to run `/cycle stop` — otherwise round prompts will keep waking you. You cannot run it yourself.
 5. Exit loop mode.
 
-Never self-terminate. Even if you think there's "nothing left to do," the Plan phase should always propose something — there's always technical debt, always a test that could be more thorough, always documentation that could be clearer. But stay honest about value: DONE is a verdict you must be able to defend, not a way to clock out. DONE is only legal when all three hold:
+Never remove the cycle yourself or invent low-value work merely to keep it busy. DONE is a verdict you must be able to defend and is only legal when all three hold:
 
 1. **The todo list is clean** — no pending or in-progress items; every entry is completed (with its goal actually achieved) or explicitly closed with a one-line reason.
 2. **Every fix made during the loop is verified** — each committed change passed the strongest available check (Ironclad Rule 7). If verification is blocked, the loop's next work is building a verification path, not DONE.
 3. **This cycle's Plan phase ran and produced its candidate list** — and every candidate was rejected with a one-line reason recorded in session state.
 
-When all three hold and the only "work" left is re-running green checks and re-reading clean diffs, report DONE with a one-line justification and end the turn. Otherwise continue the loop: close out the todos, build the missing verification path, or execute the chosen candidate. Idle status-check rounds count toward the scheduler's auto-pause threshold anyway, so an honest DONE is strictly better than manufactured busy-work — the loop stays alive for the user to redirect, and you lose nothing.
+When all three hold and the only "work" left is re-running green checks and re-reading clean diffs, report DONE with a one-line justification and end with exactly `CYCLE_OUTCOME: exhausted`. Use `CYCLE_OUTCOME: blocked` instead when the only remaining work needs external input, authorization, or an unavailable environment. The scheduler asks a later round to audit the first verdict independently and auto-pauses after the second confirmation. Do not emit either marker while a todo, unverified fix, or viable candidate remains. Otherwise continue immediately: close out the todos, build the missing verification path, or execute the chosen candidate.
 
 ## Compaction Resilience
 
