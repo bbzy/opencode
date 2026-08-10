@@ -627,6 +627,27 @@ it.instance(
 )
 
 it.instance(
+  "ask - immediately denies unattended asks",
+  () =>
+    Effect.gen(function* () {
+      const err = yield* fail(
+        ask({
+          sessionID: SessionID.make("session_test"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          unattended: true,
+          ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+        }),
+      )
+      expect(err).toBeInstanceOf(PermissionV1.DeniedError)
+      expect(yield* list()).toHaveLength(0)
+    }),
+  { git: true },
+)
+
+it.instance(
   "ask - adds request to pending list",
   () =>
     Effect.gen(function* () {
