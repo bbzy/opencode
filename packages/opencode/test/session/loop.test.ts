@@ -61,6 +61,19 @@ describe("session cycle scheduling", () => {
     expect(prompt).toContain("DONE")
   })
 
+  test("cycle challenges dry work with Reflect before escalating to Plan", () => {
+    const reflect = Loop.buildCyclePrompt(4, { consecutiveDry: Loop.loopConfig.maxDryIterations })
+    expect(reflect).toContain("Reflection challenge")
+    expect(reflect).toContain("cycle-on-project skill")
+    expect(reflect).not.toContain("Planning escalation")
+
+    const plan = Loop.buildCyclePrompt(5, { consecutiveDry: Loop.loopConfig.maxDryIterations + 1 })
+    expect(plan).toContain("Planning escalation")
+    expect(plan).toContain("responsible owner")
+    expect(plan).toContain("fixed scope")
+    expect(plan).not.toContain("Reflection challenge")
+  })
+
   test("cycle round prompts omit context lines when there is nothing to report", () => {
     const prompt = Loop.buildCyclePrompt(1, { consecutiveDry: 0 })
     expect(prompt).not.toContain("Last completed iteration")
@@ -77,14 +90,15 @@ describe("session cycle scheduling", () => {
     })
     expect(prompt).toContain('Unfinished todos (2): "Verify the build compiles", "Sync the fix to the reference demo"')
     expect(prompt).toContain("before declaring DONE")
-    expect(prompt).toContain("no unfinished todos remain")
+    expect(prompt).toContain("Emit neither marker while unfinished todos")
+    expect(prompt).toContain("CYCLE_OUTCOME: exhausted")
   })
 
   test("cycle round prompts omit the todos line when none are pending", () => {
     expect(Loop.buildCyclePrompt(2, { consecutiveDry: 0, pendingTodos: [] })).not.toContain("Unfinished todos")
   })
 
-  test("roundMadeProgress counts file-modifying tools and VCS mutations only", () => {
+  test("roundMadeProgress counts file modifications, VCS mutations, and new validation evidence", () => {
     expect(Loop.roundMadeProgress(round(toolPart({ tool: "edit", status: "completed" })), "m1")).toBe(true)
     expect(Loop.roundMadeProgress(round(toolPart({ tool: "edit", status: "error" })), "m1")).toBe(false)
     expect(
@@ -115,6 +129,30 @@ describe("session cycle scheduling", () => {
       Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "jj bookmark list" })), "m1"),
     ).toBe(false)
     expect(Loop.roundMadeProgress(round(toolPart({ tool: "read", status: "completed" })), "m1")).toBe(false)
+    expect(
+      Loop.roundMadeProgress(round(toolPart({ tool: "bash", status: "completed", command: "bun typecheck" })), "m1"),
+    ).toBe(true)
+  })
+
+  test("roundMadeProgress does not count a repeated validation command", () => {
+    const previous = toolPart({ tool: "bash", status: "completed", command: "bun test test/session/loop.test.ts" })
+    const current = toolPart({ tool: "bash", status: "completed", command: "bun test test/session/loop.test.ts" })
+    const messages = [
+      { info: { id: "m1", role: "assistant" }, parts: [previous] },
+      { info: { id: "m2", role: "assistant" }, parts: [current] },
+    ]
+    expect(Loop.roundMadeProgress(messages, "m1")).toBe(false)
+  })
+
+  test("roundOutcome requires an exact final structured marker", () => {
+    expect(Loop.roundOutcome("DONE — no work remains\nCYCLE_OUTCOME: exhausted")).toBe("exhausted")
+    expect(Loop.roundOutcome("Waiting for a device\nCYCLE_OUTCOME: blocked")).toBe("blocked")
+    expect(Loop.roundOutcome("CYCLE_OUTCOME: exhausted\nbut one more thing")).toBeUndefined()
+    expect(Loop.roundOutcome("DONE")).toBeUndefined()
+  })
+
+  test("responseFingerprint ignores changing round references", () => {
+    expect(Loop.responseFingerprint("DONE — same as #40-129")).toBe(Loop.responseFingerprint("DONE — same as #40-130"))
   })
 
   test("roundMadeProgress only counts messages past the boundary", () => {

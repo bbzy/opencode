@@ -3051,6 +3051,40 @@ it.instance(
   30_000,
 )
 
+it.instance(
+  "/cycle denies permission requests without waiting",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 50
+      try {
+        const { dir, llm } = yield* useServerConfig(providerCfg)
+        const { prompt, sessions, chat } = yield* boot({ title: "Cycle permission" })
+        yield* sessions.setPermission({
+          sessionID: chat.id,
+          permission: [{ permission: "bash", pattern: "*", action: "ask" }],
+        })
+        yield* llm.tool("bash", {
+          command: "sleep 1",
+          timeout: 1_000,
+          workdir: dir,
+        })
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "100ms" })
+        yield* llm.wait(1)
+        yield* Effect.sleep("100 millis")
+        const state = yield* prompt.loopState().pipe(Effect.map((states) => states[chat.id]))
+        expect(state?.paused).toBe(false)
+        expect(yield* Permission.Service.pipe(Effect.flatMap((permission) => permission.list()))).toHaveLength(0)
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
 noLLMServer.instance(
   "/cycle pause and resume preserve round count",
   () =>
@@ -3190,13 +3224,17 @@ it.instance(
 )
 
 it.instance(
-  "/cycle pauses after max dry iterations and status shows idle retries",
+  "/cycle escalates dry iterations through reflect and into bounded plan",
   () =>
     Effect.gen(function* () {
       const originalMin = loopConfig.minIntervalMs
       const originalMaxDry = loopConfig.maxDryIterations
+      const originalMaxPlanDry = loopConfig.maxPlanDryIterations
+      const originalMaxDuplicate = loopConfig.maxConsecutiveDuplicateResponses
       loopConfig.minIntervalMs = 100
       loopConfig.maxDryIterations = 2
+      loopConfig.maxPlanDryIterations = 10
+      loopConfig.maxConsecutiveDuplicateResponses = 10
       try {
         const { llm } = yield* useServerConfig(providerCfg)
         const { prompt, chat } = yield* boot()
@@ -3208,13 +3246,13 @@ it.instance(
           arguments: "start 200ms",
         })
 
-        yield* llm.wait(2)
+        yield* llm.wait(4)
         yield* pollWithTimeout(
           Effect.gen(function* () {
             const stateMap = yield* prompt.loopState()
-            return stateMap[chat.id]?.paused ? (true as const) : undefined
+            return (stateMap[chat.id]?.consecutiveDry ?? 0) >= 4 ? (true as const) : undefined
           }),
-          "loop never paused after dry iterations",
+          "loop never advanced beyond reflection",
           "10 seconds",
         )
 
@@ -3224,17 +3262,23 @@ it.instance(
           arguments: "status",
         })
         const statusText = (statusResult.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
-        expect(statusText).toContain("paused after 2 idle retries")
+        expect(statusText).toContain("4 consecutive idle iterations (plan)")
 
         const stateMap = yield* prompt.loopState()
         const state = stateMap[chat.id]
-        expect(state.paused).toBe(true)
-        expect(state.consecutiveDry).toBe(2)
+        expect(state.paused).toBe(false)
+        expect(state.consecutiveDry).toBeGreaterThanOrEqual(4)
+
+        const inputs = yield* llm.inputs
+        expect(JSON.stringify(inputs)).toContain("Reflection challenge")
+        expect(JSON.stringify(inputs)).toContain("Planning escalation")
 
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
       } finally {
         loopConfig.minIntervalMs = originalMin
         loopConfig.maxDryIterations = originalMaxDry
+        loopConfig.maxPlanDryIterations = originalMaxPlanDry
+        loopConfig.maxConsecutiveDuplicateResponses = originalMaxDuplicate
       }
     }),
   { config: cfg },
@@ -3284,31 +3328,109 @@ it.instance(
 )
 
 it.instance(
-  "an auto-paused cycle fires no further rounds",
+  "a dry cycle auto-pauses after the bounded Plan phase",
   () =>
     Effect.gen(function* () {
       const originalMin = loopConfig.minIntervalMs
       const originalMaxDry = loopConfig.maxDryIterations
+      const originalMaxPlanDry = loopConfig.maxPlanDryIterations
+      const originalMaxDuplicate = loopConfig.maxConsecutiveDuplicateResponses
       loopConfig.minIntervalMs = 100
       loopConfig.maxDryIterations = 1
+      loopConfig.maxPlanDryIterations = 1
+      loopConfig.maxConsecutiveDuplicateResponses = 10
       try {
         const { llm } = yield* useServerConfig(providerCfg)
         const { prompt, chat } = yield* boot()
         yield* llm.text("no file changes")
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
-        yield* llm.wait(1)
+        yield* llm.wait(3)
         yield* pollWithTimeout(
           Effect.gen(function* () {
             const stateMap = yield* prompt.loopState()
-            return stateMap[chat.id]?.paused ? (true as const) : undefined
+            const state = stateMap[chat.id]
+            return state?.paused && state.consecutiveDry >= 3 ? (true as const) : undefined
           }),
-          "loop never paused after a dry iteration",
+          "loop never paused after its bounded Plan phase",
           "10 seconds",
         )
-        // The sleep is the test: a paused cycle must stay quiet instead of
-        // firing a pending scheduled tick seconds after the pause.
+        const calls = yield* llm.calls
         yield* Effect.sleep(Duration.millis(500))
-        expect(yield* llm.calls).toBe(1)
+        expect(yield* llm.calls).toBe(calls)
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        loopConfig.maxDryIterations = originalMaxDry
+        loopConfig.maxPlanDryIterations = originalMaxPlanDry
+        loopConfig.maxConsecutiveDuplicateResponses = originalMaxDuplicate
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "two confirmed structured outcomes auto-pause the cycle",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalMaxDry = loopConfig.maxDryIterations
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxDryIterations = 10
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("DONE — no viable in-scope work remains\nCYCLE_OUTCOME: exhausted")
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
+        yield* llm.wait(2)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const state = (yield* prompt.loopState())[chat.id]
+            return state?.paused ? (true as const) : undefined
+          }),
+          "cycle never paused after two exhausted outcomes",
+          "10 seconds",
+        )
+        const inputs = JSON.stringify(yield* llm.inputs)
+        expect(inputs).toContain("previous 1 iteration(s) reported an exhausted or externally blocked outcome")
+        const calls = yield* llm.calls
+        yield* Effect.sleep(Duration.millis(400))
+        expect(yield* llm.calls).toBe(calls)
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        loopConfig.maxDryIterations = originalMaxDry
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "materially identical cross-round responses auto-pause the cycle",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalMaxDry = loopConfig.maxDryIterations
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxDryIterations = 10
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("No changes since #40-129; waiting for redirection.")
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
+        yield* llm.wait(3)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const state = (yield* prompt.loopState())[chat.id]
+            return state?.paused ? (true as const) : undefined
+          }),
+          "cycle never paused after repeated responses",
+          "10 seconds",
+        )
+        const calls = yield* llm.calls
+        yield* Effect.sleep(Duration.millis(400))
+        expect(yield* llm.calls).toBe(calls)
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
       } finally {
         loopConfig.minIntervalMs = originalMin
@@ -3462,7 +3584,7 @@ it.instance(
 )
 
 it.instance(
-  "/cycle status shows consecutive dry count before pause",
+  "/cycle status shows consecutive dry count before reflection",
   () =>
     Effect.gen(function* () {
       const originalMin = loopConfig.minIntervalMs
@@ -3496,7 +3618,7 @@ it.instance(
           arguments: "status",
         })
         const statusText = (statusResult.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
-        expect(statusText).toContain("1/5 consecutive idle iterations")
+        expect(statusText).toContain("1 consecutive idle iterations (idle)")
 
         const stateMap = yield* prompt.loopState()
         const state = stateMap[chat.id]
@@ -3896,7 +4018,7 @@ it.instance(
 )
 
 it.instance(
-  "/cycle pauses after max dry iterations",
+  "/cycle remains active after max dry iterations",
   () =>
     Effect.gen(function* () {
       const originalMin = loopConfig.minIntervalMs
@@ -3913,14 +4035,15 @@ it.instance(
         yield* pollWithTimeout(
           Effect.gen(function* () {
             const stateMap = yield* prompt.loopState()
-            return stateMap[chat.id]?.paused ? (true as const) : undefined
+            return (stateMap[chat.id]?.consecutiveDry ?? 0) > loopConfig.maxDryIterations ? (true as const) : undefined
           }),
-          "cycle never paused after dry iterations",
+          "cycle never escalated after dry iterations",
           "10 seconds",
         )
 
         const state = (yield* prompt.loopState())[chat.id]
-        expect(state.consecutiveDry).toBe(2)
+        expect(state.consecutiveDry).toBeGreaterThan(2)
+        expect(state.paused).toBe(false)
         expect(state.mode).toBe("cycle")
 
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
@@ -4048,15 +4171,12 @@ it.instance(
           arguments: "start 200ms",
         })
 
-        yield* llm.wait(2)
-        yield* pollWithTimeout(
-          Effect.gen(function* () {
-            const s = yield* prompt.loopState()
-            return s[chat.id]?.paused ? (true as const) : undefined
-          }),
-          "cycle never paused",
-          "10 seconds",
-        )
+        yield* llm.wait(1)
+        yield* prompt.command({
+          sessionID: chat.id,
+          command: "cycle",
+          arguments: "pause",
+        })
 
         yield* prompt.command({
           sessionID: chat.id,
@@ -4073,6 +4193,7 @@ it.instance(
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
       } finally {
         loopConfig.minIntervalMs = originalMin
+        loopConfig.maxDryIterations = originalMaxDry
       }
     }),
   { config: cfg },
