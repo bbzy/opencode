@@ -194,12 +194,18 @@ function msgErr(id: string): string {
 function formatLoopState(state: LoopState2): string {
   const round = state.rounds > 0 ? `#${state.rounds}` : ""
   const consecutiveDry = state.consecutiveDry ?? 0
-  const dry = consecutiveDry > 0 ? ` ${consecutiveDry}/${loopConfig.maxDryIterations} idle` : ""
+  const phase =
+    consecutiveDry > loopConfig.maxDryIterations
+      ? "plan"
+      : consecutiveDry === loopConfig.maxDryIterations
+        ? "reflect"
+        : `${consecutiveDry}/${loopConfig.maxDryIterations} idle`
+  const dry = consecutiveDry > 0 ? ` ${phase}` : ""
   const resetInterval = (state as { resetInterval?: number }).resetInterval ?? 0
   const roundsSinceReset = (state as { roundsSinceReset?: number }).roundsSinceReset ?? 0
   const reset = resetInterval > 0 ? ` ${roundsSinceReset}/${resetInterval} to reset` : ""
   if (state.paused) {
-    const reason = consecutiveDry > 0 ? `paused, ${consecutiveDry}/${loopConfig.maxDryIterations} idle` : "paused"
+    const reason = consecutiveDry > 0 ? `paused, ${phase}` : "paused"
     return `CYCLE ${round}(${reason})${reset}`.trim()
   }
   if (state.running) return `CYCLE ${round}(running${dry})${reset}`.trim()

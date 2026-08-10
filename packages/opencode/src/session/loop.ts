@@ -4,7 +4,17 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 export const loopConfig = {
   minIntervalMs: 30_000,
   maxConsecutiveFailures: 5,
+  // Consecutive rounds without file or VCS changes before the scheduler
+  // challenges the agent with the cycle skill's Reflect phase.
   maxDryIterations: 3,
+  // Dry Plan rounds get a bounded opportunity to find higher-level work.
+  // After this many additional dry rounds, pause for user redirection.
+  maxPlanDryIterations: 3,
+  // Require the model to independently confirm an exhausted/blocked verdict
+  // before pausing, so one overly eager DONE cannot end unattended work.
+  maxConsecutiveExhausted: 2,
+  // Catch cross-round text loops that do not use the structured outcome.
+  maxConsecutiveDuplicateResponses: 3,
   // Provider returned nothing (no parts, zero output tokens) this many times
   // in a row — the provider is broken, not the task; stop instead of pausing.
   maxEmptyRounds: 2,
@@ -29,13 +39,29 @@ export const FILE_MODIFY_TOOLS = new Set(["edit", "write", "apply_patch"])
 const VCS_MUTATION_PATTERN =
   /\b(?:jj|git)\s+(?:commit|split|squash|describe|abandon|rebase|new|merge|cherry-pick|revert|restore|reset|amend|undo|tag|bookmark\s+(?:move|create|delete|set|rename|track|untrack|forget))\b/
 
-// Did the round produce durable progress? Counts completed file-modifying
-// tool parts and completed bash parts that mutate VCS state, restricted to
-// assistant messages newer than the round boundary.
+const VALIDATION_PATTERN =
+  /(?:^|(?:&&|;|\|)\s*)(?:bun\s+(?:test|typecheck|run\s+(?:test|typecheck|lint|check|build))|npm\s+(?:test|run\s+(?:test|typecheck|lint|check|build))|pnpm\s+(?:test|run\s+(?:test|typecheck|lint|check|build))|yarn\s+(?:test|typecheck|lint|check|build)|cargo\s+(?:test|check|clippy|build)|go\s+test|pytest|ctest|cmake\s+--build|(?:\.\/)?gradlew?\s+[^;&|]*(?:test|check|lint|assemble|build)|make\s+(?:test|check|lint|build)|ninja(?:\s|$))/i
+
+function completedCommand(part: SessionV1.Part) {
+  if (part.type !== "tool" || part.tool !== "bash" || part.state?.status !== "completed") return
+  const command = (part.state.input as { command?: unknown } | undefined)?.command
+  return typeof command === "string" ? command.trim().replace(/\s+/g, " ") : undefined
+}
+
+// Did the round produce new evidence or durable progress? A successful
+// validation command counts once, but repeating the same green command in a
+// later round does not let a cycle evade its dry budget indefinitely.
 export function roundMadeProgress(
   messages: readonly { info: { id: string; role: string }; parts: readonly SessionV1.Part[] }[],
   boundaryId: string | undefined,
 ) {
+  const previousValidations = new Set(
+    messages
+      .filter((msg) => msg.info.role === "assistant" && boundaryId && msg.info.id <= boundaryId)
+      .flatMap((msg) => msg.parts)
+      .map(completedCommand)
+      .filter((command): command is string => !!command && VALIDATION_PATTERN.test(command)),
+  )
   return messages.some(
     (msg) =>
       msg.info.role === "assistant" &&
@@ -44,10 +70,33 @@ export function roundMadeProgress(
         if (part.type !== "tool" || part.state?.status !== "completed") return false
         if (FILE_MODIFY_TOOLS.has(part.tool)) return true
         if (part.tool !== "bash") return false
-        const command = (part.state.input as { command?: unknown } | undefined)?.command
-        return typeof command === "string" && VCS_MUTATION_PATTERN.test(command)
+        const command = completedCommand(part)
+        if (!command) return false
+        if (VCS_MUTATION_PATTERN.test(command)) return true
+        return VALIDATION_PATTERN.test(command) && !previousValidations.has(command)
       }),
   )
+}
+
+export type RoundOutcome = "exhausted" | "blocked"
+
+export function roundOutcome(response: string): RoundOutcome | undefined {
+  const marker = response
+    .trim()
+    .split("\n")
+    .findLast((line) => line.trim())
+    ?.trim()
+    .match(/^CYCLE_OUTCOME:\s*(exhausted|blocked)$/i)?.[1]
+  if (marker === "exhausted" || marker === "blocked") return marker
+}
+
+export function responseFingerprint(response: string) {
+  return response
+    .replace(/#\d+(?:-\d+)?/g, "#")
+    .replace(/\b(?:iteration|round)\s+\d+\b/gi, "round #")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase()
 }
 
 const CycleSchedule = Schema.Struct({
@@ -71,6 +120,8 @@ export type LoopState = {
   running: boolean
   consecutiveFailures: number
   consecutiveDry: number
+  consecutiveExhausted: number
+  consecutiveDuplicateResponses: number
   consecutiveEmpty: number
   coalescedCount: number
   lastStatus?: "success" | "fail"
@@ -78,6 +129,7 @@ export type LoopState = {
   resetInterval: number
   roundsSinceReset: number
   lastRoundResult?: { round: number; summary: string }
+  lastResponseFingerprint?: string
   handoff?: string
   fiber: Fiber.Fiber<void, unknown>
   trigger: (opts?: { queueWhenBusy?: boolean }) => Effect.Effect<void>
@@ -113,6 +165,7 @@ export function buildCyclePrompt(
   round: number,
   context?: {
     consecutiveDry: number
+    consecutiveExhausted?: number
     previous?: { round: number; summary: string }
     resetAfter?: boolean
     handoff?: string
@@ -134,7 +187,22 @@ export function buildCyclePrompt(
   }
   if (context && context.consecutiveDry > 0) {
     lines.push(
-      `Idle status: ${context.consecutiveDry}/${loopConfig.maxDryIterations} consecutive iterations without file or VCS changes; the cycle auto-pauses at ${loopConfig.maxDryIterations}.`,
+      `Idle status: ${context.consecutiveDry}/${loopConfig.maxDryIterations} consecutive iterations without file or VCS changes before mandatory reflection.`,
+    )
+  }
+  if (context && context.consecutiveDry === loopConfig.maxDryIterations) {
+    lines.push(
+      `Reflection challenge: load the cycle-on-project skill and perform its Reflect phase now. Do not rubber-stamp the previous work. Challenge its design, test coverage, process, commit organization, and the health of the wider scope. If any concern survives scrutiny, turn it into a concrete task and act on it. Proceed to Plan only if every dimension passes an honest review.`,
+    )
+  }
+  if (context && context.consecutiveDry > loopConfig.maxDryIterations) {
+    lines.push(
+      `Planning escalation: the Reflect phase found no issue requiring rework. Load the cycle-on-project skill and perform its Plan phase now. Think as the responsible owner at a higher level, generate concrete in-scope candidates, choose the highest-value one yourself, and start it. Widen the frontier only when the user did not define a fixed scope.`,
+    )
+  }
+  if (context?.consecutiveExhausted) {
+    lines.push(
+      `The previous ${context.consecutiveExhausted} iteration(s) reported an exhausted or externally blocked outcome. Audit that verdict independently. Resume work if a viable candidate exists; otherwise confirm the outcome again.`,
     )
   }
   if (context?.resetAfter) {
@@ -152,10 +220,10 @@ export function buildCyclePrompt(
     `If you already completed iteration ${round} or later, treat this as a duplicate delivery: confirm briefly without redoing work.`,
   )
   lines.push(
-    `If no meaningful work remains, say DONE with a one-line reason instead of running status-check-only rounds.`,
+    `If no meaningful work remains, say DONE with a one-line reason and end the response with exactly CYCLE_OUTCOME: exhausted.`,
   )
   lines.push(
-    `Say DONE only when no unfinished todos remain, every committed fix is verified, and this cycle's Plan phase produced no viable candidate — then report DONE with a one-line reason instead of running status-check-only rounds.`,
+    `Use CYCLE_OUTCOME: blocked instead when the only remaining work requires external input, authorization, or an unavailable environment. Emit neither marker while unfinished todos, unverified fixes, or viable candidates remain. Two confirmed outcome rounds pause the scheduler for user redirection.`,
   )
   return lines.join("\n")
 }

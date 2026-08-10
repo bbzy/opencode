@@ -107,6 +107,16 @@ function roundErrorMessage(error: NonNullable<SessionV1.Assistant["error"]>) {
   return isRecord(data) && typeof data.message === "string" ? data.message : error.name
 }
 
+type RunLoopOptions = {
+  unattended?: boolean
+}
+
+type RunLoop = (sessionID: SessionID, options?: RunLoopOptions) => Effect.Effect<SessionV1.WithParts>
+type LoopRun = (
+  input: PromptInput,
+  options?: RunLoopOptions,
+) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.BusyError>
+
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
 
 IMPORTANT:
@@ -147,7 +157,7 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
-  readonly loopRun: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.BusyError>
+  readonly loopRun: LoopRun
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -1139,8 +1149,9 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    // prettier-ignore
+    const runLoop: RunLoop = Effect.fn("SessionPrompt.run")(
+      function* (sessionID: SessionID, options?: RunLoopOptions) {
         return yield* Effect.gen(function* () {
           const ctx = yield* InstanceState.context
           let structured: unknown
@@ -1278,6 +1289,7 @@ const layer = Layer.effect(
                 assistantMessage: msg,
                 sessionID,
                 model,
+                unattended: options?.unattended,
               })
               .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
@@ -1294,6 +1306,7 @@ const layer = Layer.effect(
                 bypassAgentCheck,
                 messages: msgs,
                 promptOps,
+                unattended: options?.unattended,
               }).pipe(
                 Effect.provideService(Plugin.Service, plugin),
                 Effect.provideService(Permission.Service, permission),
@@ -1593,8 +1606,9 @@ const layer = Layer.effect(
       )
     })
 
-    const loopRun: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.BusyError> =
-      Effect.fn("SessionPrompt.loopRun")(function* (input: PromptInput) {
+    // prettier-ignore
+    const loopRun: LoopRun = Effect.fn("SessionPrompt.loopRun")(
+      function* (input: PromptInput, options?: RunLoopOptions) {
         const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
         yield* revert.cleanup(session)
         // The prompt message is admitted only after the drain is acquired: a
@@ -1611,10 +1625,11 @@ const layer = Layer.effect(
             // the runner's error channel clean.
             yield* createUserMessage(input).pipe(Effect.orDie)
             yield* sessions.touch(input.sessionID)
-            return yield* runLoop(input.sessionID)
+            return yield* runLoop(input.sessionID, options)
           }),
         )
-      })
+      },
+    )
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
@@ -1667,11 +1682,20 @@ const layer = Layer.effect(
       const buildPrompt = (
         round: number,
         consecutiveDry: number,
+        consecutiveExhausted: number,
         previous: { round: number; summary: string } | undefined,
         resetAfter: boolean,
         handoff: string | undefined,
         pendingTodos: readonly string[] = [],
-      ) => Loop.buildCyclePrompt(round, { consecutiveDry, previous, resetAfter, handoff, pendingTodos })
+      ) =>
+        Loop.buildCyclePrompt(round, {
+          consecutiveDry,
+          consecutiveExhausted,
+          previous,
+          resetAfter,
+          handoff,
+          pendingTodos,
+        })
       // Last busy→idle transition for this session; drives the cycle mode's
       // idle-anchored schedule. Bootstrapped to the fiber start so a cycle
       // started on a long-idle session fires on time.
@@ -1796,14 +1820,25 @@ const layer = Layer.effect(
             .filter((item) => item.status !== "completed" && item.status !== "cancelled")
             .map((item) => item.content)
           const exit = yield* Effect.gen(function* () {
-            const fullPrompt = buildPrompt(round, current.consecutiveDry, previous, resetAfter, handoff, pendingTodos)
+            const fullPrompt = buildPrompt(
+              round,
+              current.consecutiveDry,
+              current.consecutiveExhausted,
+              previous,
+              resetAfter,
+              handoff,
+              pendingTodos,
+            )
             const before = yield* sessions.messages({ sessionID: input.sessionID, limit: 1 }).pipe(Effect.orDie)
             const boundaryId = before[0]?.info.id
-            const result = yield* loopRun({
-              sessionID: input.sessionID,
-              model: yield* currentModel(input.sessionID),
-              parts: [{ type: "text" as const, text: fullPrompt }],
-            })
+            const result = yield* loopRun(
+              {
+                sessionID: input.sessionID,
+                model: yield* currentModel(input.sessionID),
+                parts: [{ type: "text" as const, text: fullPrompt }],
+              },
+              { unattended: true },
+            )
             // The boundary check alone misses mid-round aborts: onInterrupt
             // resolves with the current round's own aborted assistant message,
             // which is newer than the boundary.
@@ -1840,6 +1875,9 @@ const layer = Layer.effect(
           const recordFailure = Effect.fnUntraced(function* (error: string) {
             const errorMsg = error.slice(0, 200)
             current.consecutiveFailures++
+            current.consecutiveExhausted = 0
+            current.consecutiveDuplicateResponses = 0
+            current.lastResponseFingerprint = undefined
             current.lastStatus = "fail"
             yield* Effect.logError("loop iteration failed", {
               "session.id": input.sessionID,
@@ -1894,6 +1932,9 @@ const layer = Layer.effect(
               )
             if (emptyRound) {
               current.consecutiveEmpty++
+              current.consecutiveExhausted = 0
+              current.consecutiveDuplicateResponses = 0
+              current.lastResponseFingerprint = undefined
               current.lastRoundResult = {
                 round,
                 summary: "Provider returned an empty response (no content, no output tokens)",
@@ -1929,9 +1970,40 @@ const layer = Layer.effect(
               .filter((part): part is SessionV1.TextPart => part.type === "text")
               .map((part) => part.text)
               .join("\n")
-              .slice(0, 5000)
             current.lastRoundResult = { round, summary: response.replace(/\s+/g, " ").trim().slice(-300) }
+            const fingerprint = Loop.responseFingerprint(response)
+            current.consecutiveDuplicateResponses =
+              !madeProgress && fingerprint
+                ? fingerprint === current.lastResponseFingerprint
+                  ? current.consecutiveDuplicateResponses + 1
+                  : 1
+                : 0
+            current.lastResponseFingerprint = !madeProgress && fingerprint ? fingerprint : undefined
+            const remainingTodos = (yield* todo.get(input.sessionID)).some(
+              (item) => item.status !== "completed" && item.status !== "cancelled",
+            )
+            const outcome = remainingTodos ? undefined : Loop.roundOutcome(response)
+            current.consecutiveExhausted = outcome ? current.consecutiveExhausted + 1 : 0
             if (handoff) current.handoff = undefined
+            const planDryLimit = Loop.loopConfig.maxDryIterations + 1 + Loop.loopConfig.maxPlanDryIterations
+            const pauseReason =
+              current.consecutiveExhausted >= Loop.loopConfig.maxConsecutiveExhausted
+                ? `${current.consecutiveExhausted} confirmed ${outcome} outcomes`
+                : current.consecutiveDuplicateResponses >= Loop.loopConfig.maxConsecutiveDuplicateResponses
+                  ? `${current.consecutiveDuplicateResponses} materially identical responses`
+                  : current.consecutiveDry >= planDryLimit
+                    ? `${current.consecutiveDry} consecutive iterations without new evidence or durable changes`
+                    : undefined
+            if (pauseReason) {
+              current.paused = true
+              yield* noReply(
+                input.sessionID,
+                undefined,
+                `[${word} #${round}] Auto-paused after ${pauseReason}. Use /cycle resume after redirecting the work or changing the external conditions.`,
+              )
+              yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
+              continue
+            }
             if (current.resetInterval > 0) {
               current.roundsSinceReset++
             }
@@ -1953,27 +2025,15 @@ const layer = Layer.effect(
                 `[${word} #${round}] Session reset: history cleared, handoff stored for the next iteration.`,
               )
             }
-            if (current.consecutiveDry >= Loop.loopConfig.maxDryIterations) {
-              const announce = !current.paused
-              current.paused = true
-              yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
-              // A user pause that landed mid-round already told the user about
-              // the pause; only announce auto-pauses.
-              if (announce) {
-                yield* noReply(
-                  input.sessionID,
-                  undefined,
-                  `[${word} #${round}] Auto-paused: the last ${Loop.loopConfig.maxDryIterations} iterations completed without file or VCS changes. Use /cycle resume to continue.`,
-                )
-              }
-              continue
-            }
           } else if (exit._tag === "interrupted") {
             // A user abort is a skipped round, not a failure: it must not
             // count toward consecutiveFailures or the auto-stop threshold.
             // Aborting an automated round means the user wants the automation
             // to hold, so pause instead of firing the next scheduled round.
             current.paused = true
+            current.consecutiveExhausted = 0
+            current.consecutiveDuplicateResponses = 0
+            current.lastResponseFingerprint = undefined
             yield* noReply(
               input.sessionID,
               undefined,
@@ -2033,6 +2093,8 @@ const layer = Layer.effect(
         running: false,
         consecutiveFailures: 0,
         consecutiveDry: 0,
+        consecutiveExhausted: 0,
+        consecutiveDuplicateResponses: 0,
         consecutiveEmpty: 0,
         coalescedCount: 0,
         timezone: Loop.timezone(),
@@ -2101,7 +2163,8 @@ const layer = Layer.effect(
         "",
         `Minimum interval: ${Loop.loopConfig.minIntervalMs / 1000}s`,
         `Auto-stops after ${Loop.loopConfig.maxConsecutiveFailures} consecutive failures`,
-        `Auto-pauses after ${Loop.loopConfig.maxDryIterations} consecutive rounds with no file modifications`,
+        `Challenges the model to Reflect after ${Loop.loopConfig.maxDryIterations} dry rounds, then allows ${Loop.loopConfig.maxPlanDryIterations} bounded Plan rounds before pausing`,
+        `Auto-pauses after ${Loop.loopConfig.maxConsecutiveExhausted} confirmed exhausted/blocked outcomes or ${Loop.loopConfig.maxConsecutiveDuplicateResponses} repeated responses`,
         "",
         "Examples:",
         "  /cycle 5m",
@@ -2210,9 +2273,7 @@ const layer = Layer.effect(
         const existing = activeCycles.get(input.sessionID)
         if (existing) {
           const stateInfo = existing.paused
-            ? existing.consecutiveDry >= Loop.loopConfig.maxDryIterations
-              ? ` (paused after ${existing.consecutiveDry} idle retries)`
-              : " (paused)"
+            ? " (paused)"
             : existing.running
               ? " (running)"
               : existing.pending
@@ -2220,8 +2281,19 @@ const layer = Layer.effect(
                 : ""
           const parts = [`${existing.rounds} rounds completed`]
           if (existing.consecutiveFailures > 0) parts.push(`${existing.consecutiveFailures} consecutive failures`)
-          if (existing.consecutiveDry > 0)
-            parts.push(`${existing.consecutiveDry}/${Loop.loopConfig.maxDryIterations} consecutive idle iterations`)
+          if (existing.consecutiveDry > 0) {
+            const phase =
+              existing.consecutiveDry > Loop.loopConfig.maxDryIterations
+                ? "plan"
+                : existing.consecutiveDry === Loop.loopConfig.maxDryIterations
+                  ? "reflect"
+                  : "idle"
+            parts.push(`${existing.consecutiveDry} consecutive idle iterations (${phase})`)
+          }
+          if (existing.consecutiveExhausted > 0)
+            parts.push(`${existing.consecutiveExhausted} consecutive exhausted/blocked outcomes`)
+          if (existing.consecutiveDuplicateResponses > 1)
+            parts.push(`${existing.consecutiveDuplicateResponses} materially identical responses`)
           if (existing.resetInterval > 0)
             parts.push(`${existing.roundsSinceReset}/${existing.resetInterval} rounds since last reset`)
           if (existing.coalescedCount > 0) parts.push(`${existing.coalescedCount} ticks coalesced`)
@@ -2257,7 +2329,10 @@ const layer = Layer.effect(
         }
         existing.paused = false
         existing.consecutiveDry = 0
+        existing.consecutiveExhausted = 0
+        existing.consecutiveDuplicateResponses = 0
         existing.consecutiveEmpty = 0
+        existing.lastResponseFingerprint = undefined
         existing.consecutiveFailures = 0
         const now = yield* Clock.currentTimeMillis
         const nextRunAt = Loop.nextScheduledAt(existing.schedule, now)
