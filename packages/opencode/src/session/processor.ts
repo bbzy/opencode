@@ -77,6 +77,7 @@ type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
+  unattended?: boolean
 }
 
 export interface Interface {
@@ -423,6 +424,7 @@ const layer = Layer.effect(
               metadata: { tool: value.name, input },
               always: [value.name],
               ruleset: agent.permission,
+              unattended: ctx.unattended,
             })
             return
           }
