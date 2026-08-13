@@ -24,9 +24,13 @@ export const loopConfig = {
   // history no longer fits and fails — compacting earlier keeps that path
   // from ever running.
   compactionThreshold: 0.7,
-  // Maximum chars of the last assistant response to keep as the handoff
-  // text when a session reset occurs.
-  handoffMaxLength: 10_000,
+  // Chaos is sampled periodically, and immediately when the scheduler has
+  // already observed a risk signal such as a no-progress round.
+  chaosAssessmentInterval: 3,
+  // A cycle round should land one verifiable unit and yield. This is a soft
+  // provider-turn boundary: the model receives a checkpoint instruction but
+  // in-flight tools are never interrupted.
+  maxRoundProviderTurns: 20,
 }
 
 export const FILE_MODIFY_TOOLS = new Set(["edit", "write", "apply_patch"])
@@ -48,12 +52,38 @@ function completedCommand(part: SessionV1.Part) {
   return typeof command === "string" ? command.trim().replace(/\s+/g, " ") : undefined
 }
 
+function completedToolSignature(part: SessionV1.Part) {
+  if (part.type !== "tool" || part.state?.status !== "completed") return
+  return `${part.tool}:${JSON.stringify(part.state.input)}`
+}
+
+export type RoundProgress = {
+  kind: "validated" | "committed" | "diagnosed" | "todo" | "none"
+  goal: string
+  evidence: string
+}
+
+export function roundProgress(response: string): RoundProgress | undefined {
+  const marker = response.lastIndexOf("CYCLE_PROGRESS")
+  if (marker < 0) return
+  const block = response.slice(marker)
+  const kind = block.match(/^kind:\s*(validated|committed|diagnosed|todo|none)\s*$/im)?.[1] as
+    | RoundProgress["kind"]
+    | undefined
+  const goal = block.match(/^goal:\s*(.+)$/im)?.[1]?.trim()
+  const evidence = block.match(/^evidence:\s*(.+)$/im)?.[1]?.trim()
+  if (!kind || !goal || !evidence) return
+  return { kind, goal, evidence }
+}
+
 // Did the round produce new evidence or durable progress? A successful
 // validation command counts once, but repeating the same green command in a
 // later round does not let a cycle evade its dry budget indefinitely.
 export function roundMadeProgress(
   messages: readonly { info: { id: string; role: string }; parts: readonly SessionV1.Part[] }[],
   boundaryId: string | undefined,
+  response = "",
+  todoChanged = false,
 ) {
   const previousValidations = new Set(
     messages
@@ -62,20 +92,33 @@ export function roundMadeProgress(
       .map(completedCommand)
       .filter((command): command is string => !!command && VALIDATION_PATTERN.test(command)),
   )
-  return messages.some(
-    (msg) =>
-      msg.info.role === "assistant" &&
-      (!boundaryId || msg.info.id > boundaryId) &&
-      msg.parts.some((part) => {
-        if (part.type !== "tool" || part.state?.status !== "completed") return false
-        if (FILE_MODIFY_TOOLS.has(part.tool)) return true
-        if (part.tool !== "bash") return false
-        const command = completedCommand(part)
-        if (!command) return false
-        if (VCS_MUTATION_PATTERN.test(command)) return true
-        return VALIDATION_PATTERN.test(command) && !previousValidations.has(command)
-      }),
+  const previousTools = new Set(
+    messages
+      .filter((msg) => msg.info.role === "assistant" && boundaryId && msg.info.id <= boundaryId)
+      .flatMap((msg) => msg.parts)
+      .map(completedToolSignature)
+      .filter((signature): signature is string => !!signature),
   )
+  const parts = messages
+    .filter((msg) => msg.info.role === "assistant" && (!boundaryId || msg.info.id > boundaryId))
+    .flatMap((msg) => msg.parts)
+    .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.state?.status === "completed")
+  const commands = parts.map(completedCommand).filter((command): command is string => !!command)
+  const committed = commands.some((command) => VCS_MUTATION_PATTERN.test(command))
+  const validated = commands.some((command) => VALIDATION_PATTERN.test(command) && !previousValidations.has(command))
+  const declared = roundProgress(response)
+  if (!declared || declared.kind === "none") return false
+  if (declared.kind === "committed") return committed
+  if (declared.kind === "validated") return validated
+  if (declared.kind === "todo") return todoChanged && parts.some((part) => part.tool === "todowrite")
+  if (declared.kind === "diagnosed")
+    return parts.some(
+      (part) =>
+        !FILE_MODIFY_TOOLS.has(part.tool) &&
+        part.tool !== "todowrite" &&
+        !previousTools.has(completedToolSignature(part)!),
+    )
+  return false
 }
 
 export type RoundOutcome = "exhausted" | "blocked"
@@ -90,8 +133,18 @@ export function roundOutcome(response: string): RoundOutcome | undefined {
   if (marker === "exhausted" || marker === "blocked") return marker
 }
 
+export function eligibleRoundOutcome(response: string, todos: readonly { status: string }[]) {
+  const outcome = roundOutcome(response)
+  if (todos.some((item) => item.status !== "completed" && item.status !== "cancelled" && item.status !== "blocked"))
+    return
+  if (outcome === "exhausted" && todos.some((item) => item.status === "blocked")) return
+  return outcome
+}
+
 export function responseFingerprint(response: string) {
   return response
+    .replace(/\n?CYCLE_CHAOS[\s\S]*?(?=\nCYCLE_OUTCOME:|$)/gi, "")
+    .replace(/\n?CYCLE_PROGRESS[\s\S]*?(?=\nCYCLE_CHAOS|\nCYCLE_OUTCOME:|$)/gi, "")
     .replace(/#\d+(?:-\d+)?/g, "#")
     .replace(/\b(?:iteration|round)\s+\d+\b/gi, "round #")
     .replace(/\s+/g, " ")
@@ -126,13 +179,51 @@ export type LoopState = {
   coalescedCount: number
   lastStatus?: "success" | "fail"
   timezone: string
-  resetInterval: number
-  roundsSinceReset: number
-  lastRoundResult?: { round: number; summary: string }
+  lastChaos?: ChaosAssessment & { round: number }
   lastResponseFingerprint?: string
-  handoff?: string
   fiber: Fiber.Fiber<void, unknown>
   trigger: (opts?: { queueWhenBusy?: boolean }) => Effect.Effect<void>
+}
+
+export type ChaosAssessment = {
+  score: number
+  stateClarity: number
+  historyNoise: number
+  conflictDrift: number
+  executionContinuity: number
+  contextPressure: number
+  reason?: string
+}
+
+const chaosDimensions = [
+  ["state_clarity", "stateClarity", 7.5],
+  ["history_noise", "historyNoise", 5],
+  ["conflict_drift", "conflictDrift", 6.25],
+  ["execution_continuity", "executionContinuity", 3.75],
+  ["context_pressure", "contextPressure", 2.5],
+] as const
+
+export function chaosAssessment(response: string): ChaosAssessment | undefined {
+  const marker = response.lastIndexOf("CYCLE_CHAOS")
+  if (marker < 0) return
+  const block = response.slice(marker)
+  const values = Object.fromEntries(
+    chaosDimensions.flatMap(([label, key]) => {
+      const value = Number(block.match(new RegExp(`^${label}:\\s*([0-4])\\s*$`, "mi"))?.[1])
+      return Number.isInteger(value) ? [[key, value]] : []
+    }),
+  ) as Partial<Record<(typeof chaosDimensions)[number][1], number>>
+  if (chaosDimensions.some(([, key]) => values[key] === undefined)) return
+  const reason = block.match(/^reason:\s*(.+)$/im)?.[1]?.trim()
+  return {
+    score: chaosDimensions.reduce((total, [, key, weight]) => total + values[key]! * weight, 0),
+    stateClarity: values.stateClarity!,
+    historyNoise: values.historyNoise!,
+    conflictDrift: values.conflictDrift!,
+    executionContinuity: values.executionContinuity!,
+    contextPressure: values.contextPressure!,
+    ...(reason ? { reason } : {}),
+  }
 }
 
 export function timezone() {
@@ -158,6 +249,10 @@ export function scheduleMode(): "cycle" {
   return "cycle"
 }
 
+export function roundNeedsCheckpoint(providerTurns: number) {
+  return providerTurns >= loopConfig.maxRoundProviderTurns
+}
+
 // Cycle prompts omit "Next:" deliberately: the next round starts <interval>
 // after this round *ends*, so any clock time shown here would be wrong for
 // rounds longer than the interval.
@@ -166,25 +261,16 @@ export function buildCyclePrompt(
   context?: {
     consecutiveDry: number
     consecutiveExhausted?: number
-    previous?: { round: number; summary: string }
-    resetAfter?: boolean
-    handoff?: string
     pendingTodos?: readonly string[]
+    blockedTodos?: readonly string[]
+    assessChaos?: boolean
+    contextUsage?: number
   },
 ) {
   const now = new Date()
   const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`
   const time = now.toTimeString().slice(0, 5)
   const lines = [`[Cycle #${round}] Automated cycle — iteration ${round}. ${date} ${time}.`]
-  if (context?.handoff) {
-    lines.push(
-      `Session was reset after the previous iteration. Here is the handoff from the previous agent:`,
-      context.handoff,
-    )
-  }
-  if (context?.previous) {
-    lines.push(`Last completed iteration: #${context.previous.round} — ${context.previous.summary}`)
-  }
   if (context && context.consecutiveDry > 0) {
     lines.push(
       `No-progress status: ${context.consecutiveDry}/${loopConfig.maxDryIterations} consecutive iterations without durable changes or new validation evidence before mandatory reflection.`,
@@ -192,12 +278,12 @@ export function buildCyclePrompt(
   }
   if (context && context.consecutiveDry === loopConfig.maxDryIterations) {
     lines.push(
-      `Reflection challenge: load the cycle-on-project skill and perform its Reflect phase now. Do not rubber-stamp the previous work. Challenge its design, test coverage, process, commit organization, and the health of the wider scope. If any concern survives scrutiny, turn it into a concrete task and act on it. Proceed to Plan only if every dimension passes an honest review.`,
+      `Reflection challenge: load the cycle-on-project skill and perform its Reflect phase now. Do not rubber-stamp the previous work. Challenge its design, test coverage, process, commit organization, and the health of the wider scope. Turn surviving concerns into candidates, compare them with the existing backlog by user impact, risk, blocking value, cost, evidence, and authorization, then act on the highest-value in-scope candidate. A newly discovered concern does not automatically outrank existing work. Proceed to Plan only if every dimension passes an honest review.`,
     )
   }
   if (context && context.consecutiveDry > loopConfig.maxDryIterations) {
     lines.push(
-      `Planning escalation: the Reflect phase found no issue requiring rework. Load the cycle-on-project skill and perform its Plan phase now. Think as the responsible owner at a higher level, generate concrete in-scope candidates, choose the highest-value one yourself, and start it. Widen the frontier only when the user did not define a fixed scope.`,
+      `Planning escalation: the Reflect phase found no issue requiring rework. Load the cycle-on-project skill and perform its Plan phase now. Think as the responsible owner at a higher level, compare concrete in-scope candidates by user impact, risk, blocking value, cost, evidence, and authorization, then start the highest-value one yourself. Widen the frontier only when the user did not define a fixed scope. Do not invent work merely to remain active: a possible improvement is not viable when its value, certainty, authorization, or benefit-to-cost ratio cannot justify another round.`,
     )
   }
   if (context?.consecutiveExhausted) {
@@ -205,9 +291,22 @@ export function buildCyclePrompt(
       `The previous ${context.consecutiveExhausted} iteration(s) reported an exhausted or externally blocked outcome. Audit that verdict independently. Resume work if a viable candidate exists; otherwise confirm the outcome again.`,
     )
   }
-  if (context?.resetAfter) {
+  if (context?.assessChaos) {
     lines.push(
-      `⚠ This is the last iteration before a session reset. After you complete this iteration, the conversation history will be cleared to free context. Write a handoff summary for the next iteration's agent — describe the current state, what has been accomplished, and what remains to be done. The handoff will be included in the next iteration's prompt after the reset.`,
+      `At the end of this iteration, assess how risky it would be to carry the full session history into another round. This measures conversation health, not project difficulty or remaining workload. Score each dimension from 0 (healthy) to 4 (severely chaotic), then include this exact block after your work report:`,
+      `CYCLE_CHAOS`,
+      `state_clarity: <0-4>`,
+      `history_noise: <0-4>`,
+      `conflict_drift: <0-4>`,
+      `execution_continuity: <0-4>`,
+      `context_pressure: <0-4>`,
+      `reason: <one concise sentence>`,
+      ...(context.contextUsage !== undefined
+        ? [
+            `Engine context utilization: ${Math.round(context.contextUsage * 100)}%. Use this as evidence for context pressure, not as the total chaos score.`,
+          ]
+        : []),
+      `State clarity asks whether scope, current work, completed work, blockers, and next evidence are unambiguous. History noise measures obsolete or repetitive material. Conflict drift measures contradictions and scope/state drift. Execution continuity measures repetition, open branches, and missing closure. Context pressure measures whether the history is becoming hard to use. Do not calculate a total score; the engine does that.`,
     )
   }
   if (context?.pendingTodos && context.pendingTodos.length > 0) {
@@ -216,14 +315,28 @@ export function buildCyclePrompt(
       `Unfinished todos (${context.pendingTodos.length}): ${todos.join(", ")}. Resolve them or explicitly close them before declaring DONE.`,
     )
   }
+  if (context?.blockedTodos && context.blockedTodos.length > 0) {
+    const todos = context.blockedTodos.slice(0, 10).map((content) => `"${content.slice(0, 120)}"`)
+    lines.push(
+      `Blocked tasks (${context.blockedTodos.length}): ${todos.join(", ")}. A blocked task does not block the responsibility scope: preserve its unblock condition and choose another worthwhile in-scope candidate. Report CYCLE_OUTCOME: blocked only when Check, Reflect, and Plan confirm that the entire scope has no worthwhile independently actionable work.`,
+    )
+  }
+  lines.push(
+    `Before ending, reconcile the todo list with this report: complete achieved items, mark externally waiting items blocked with the unblock condition in their content, add material candidates, and close stale candidates explicitly. Then include this exact block:`,
+    `CYCLE_PROGRESS`,
+    `kind: <validated|committed|diagnosed|todo|none>`,
+    `goal: <the responsibility-scope objective advanced this round>`,
+    `evidence: <the new validation, commit, diagnostic fact, todo transition, or why none>`,
+    `Use validated only for a newly successful relevant check, committed only for a durable VCS mutation, diagnosed only for new tool-backed evidence that materially changes the problem state, todo only for a real work-item state transition, and none when the round produced activity but no durable evidence. File edits alone are activity, not progress.`,
+  )
   lines.push(
     `If you already completed iteration ${round} or later, treat this as a duplicate delivery: confirm briefly without redoing work.`,
   )
   lines.push(
-    `If no meaningful work remains, say DONE with a one-line reason and end the response with exactly CYCLE_OUTCOME: exhausted.`,
+    `If Check, Reflect, and Plan confirm that no remaining candidate has enough value, certainty, authorization, or benefit-to-cost ratio to justify another round, say DONE with a one-line reason and end the response with exactly CYCLE_OUTCOME: exhausted.`,
   )
   lines.push(
-    `Use CYCLE_OUTCOME: blocked instead when the only remaining work requires external input, authorization, or an unavailable environment. Emit neither marker while unfinished todos, unverified fixes, or viable candidates remain. Two confirmed outcome rounds pause the scheduler for user redirection.`,
+    `Use CYCLE_OUTCOME: blocked instead only when the entire responsibility scope has no worthwhile independently actionable work because every viable path requires external input, authorization, or an unavailable environment. Emit neither marker while actionable todos, unverified fixes, or worthwhile viable candidates remain. Two confirmed outcome rounds pause the scheduler for user redirection.`,
   )
   return lines.join("\n")
 }

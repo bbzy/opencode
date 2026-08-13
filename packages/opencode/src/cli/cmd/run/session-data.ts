@@ -201,16 +201,13 @@ function formatLoopState(state: LoopState2): string {
         ? "reflect"
         : `${consecutiveDry}/${loopConfig.maxDryIterations} no-progress`
   const dry = consecutiveDry > 0 ? ` ${phase}` : ""
-  const resetInterval = (state as { resetInterval?: number }).resetInterval ?? 0
-  const roundsSinceReset = (state as { roundsSinceReset?: number }).roundsSinceReset ?? 0
-  const reset = resetInterval > 0 ? ` ${roundsSinceReset}/${resetInterval} to reset` : ""
   if (state.paused) {
     const reason = consecutiveDry > 0 ? `paused, ${phase}` : "paused"
-    return `CYCLE ${round}(${reason})${reset}`.trim()
+    return `CYCLE ${round}(${reason})`.trim()
   }
-  if (state.running) return `CYCLE ${round}(running${dry})${reset}`.trim()
-  if (state.pending) return `CYCLE ${round}(queued${dry})${reset}`.trim()
-  return `CYCLE ${round}(${state.intervalStr})${dry}${reset}`.trim()
+  if (state.running) return `CYCLE ${round}(running${dry})`.trim()
+  if (state.pending) return `CYCLE ${round}(queued${dry})`.trim()
+  return `CYCLE ${round}(${state.intervalStr})${dry}`.trim()
 }
 
 function patch(patch?: FooterPatch, view?: FooterView): FooterOutput | undefined {
