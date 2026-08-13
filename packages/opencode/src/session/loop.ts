@@ -187,7 +187,7 @@ export function buildCyclePrompt(
   }
   if (context && context.consecutiveDry > 0) {
     lines.push(
-      `Idle status: ${context.consecutiveDry}/${loopConfig.maxDryIterations} consecutive iterations without file or VCS changes before mandatory reflection.`,
+      `No-progress status: ${context.consecutiveDry}/${loopConfig.maxDryIterations} consecutive iterations without durable changes or new validation evidence before mandatory reflection.`,
     )
   }
   if (context && context.consecutiveDry === loopConfig.maxDryIterations) {
