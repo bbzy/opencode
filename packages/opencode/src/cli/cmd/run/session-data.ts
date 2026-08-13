@@ -199,7 +199,7 @@ function formatLoopState(state: LoopState2): string {
       ? "plan"
       : consecutiveDry === loopConfig.maxDryIterations
         ? "reflect"
-        : `${consecutiveDry}/${loopConfig.maxDryIterations} idle`
+        : `${consecutiveDry}/${loopConfig.maxDryIterations} no-progress`
   const dry = consecutiveDry > 0 ? ` ${phase}` : ""
   const resetInterval = (state as { resetInterval?: number }).resetInterval ?? 0
   const roundsSinceReset = (state as { roundsSinceReset?: number }).roundsSinceReset ?? 0

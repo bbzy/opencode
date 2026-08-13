@@ -2287,8 +2287,8 @@ const layer = Layer.effect(
                 ? "plan"
                 : existing.consecutiveDry === Loop.loopConfig.maxDryIterations
                   ? "reflect"
-                  : "idle"
-            parts.push(`${existing.consecutiveDry} consecutive idle iterations (${phase})`)
+                  : "tracking"
+            parts.push(`${existing.consecutiveDry} consecutive no-progress iterations (${phase})`)
           }
           if (existing.consecutiveExhausted > 0)
             parts.push(`${existing.consecutiveExhausted} consecutive exhausted/blocked outcomes`)
