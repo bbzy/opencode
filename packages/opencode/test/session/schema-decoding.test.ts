@@ -259,6 +259,15 @@ describe("Todo.Info", () => {
     const input = Todo.Info.make({ content: "do a thing", status: "pending", priority: "high" })
     expect(decode(input)).toEqual(input)
   })
+
+  test("blocked status records its unblock condition in content", () => {
+    const input = Todo.Info.make({
+      content: "device acceptance — unblock when the user tests the preview",
+      status: "blocked",
+      priority: "high",
+    })
+    expect(decode(input)).toEqual(input)
+  })
 })
 
 describe("SessionPrompt input schemas", () => {

@@ -21,8 +21,6 @@ export const LoopState = Schema.Struct({
   consecutiveDry: NonNegativeInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
   coalescedCount: NonNegativeInt,
   lastStatus: optional(Schema.Literals(["success", "fail"])),
-  resetInterval: NonNegativeInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
-  roundsSinceReset: NonNegativeInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
 }).annotate({ identifier: "LoopState" })
 export type LoopState = Schema.Schema.Type<typeof LoopState>
 

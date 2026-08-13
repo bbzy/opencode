@@ -7,7 +7,8 @@ import { SessionID } from "./session-id"
 export const Info = Schema.Struct({
   content: Schema.String.annotate({ description: "Brief description of the task" }),
   status: Schema.String.annotate({
-    description: "Current status of the task: pending, in_progress, completed, cancelled",
+    description:
+      "Current status of the task. blocked means the item cannot advance until the unblock condition recorded in content becomes true; it does not imply the whole responsibility scope is blocked.",
   }),
   priority: Schema.String.annotate({
     description: "Priority level of the task: high, medium, low",

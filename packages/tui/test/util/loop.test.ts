@@ -64,16 +64,13 @@ describe("util.loop.formatLoopState", () => {
     expect(formatLoopState(state)).toBe("CYCLE #1(every 5m)")
   })
 
-  test("idle iterations show dry count", () => {
-    expect(formatLoopState(makeState({ rounds: 2, consecutiveDry: 1 }))).toContain("1 idle")
-    expect(formatLoopState(makeState({ rounds: 2, running: true, consecutiveDry: 2 }))).toBe("CYCLE #2(running 2 idle)")
-    expect(formatLoopState(makeState({ rounds: 3, paused: true, consecutiveDry: 3 }))).toBe("CYCLE #3(paused, 3 idle)")
-  })
-
-  test("reset interval shows progress", () => {
-    const state = makeState({ rounds: 5 }) as LoopState2 & { resetInterval: number; roundsSinceReset: number }
-    state.resetInterval = 10
-    state.roundsSinceReset = 3
-    expect(formatLoopState(state)).toContain("3/10 to reset")
+  test("no-progress iterations show dry count", () => {
+    expect(formatLoopState(makeState({ rounds: 2, consecutiveDry: 1 }))).toContain("1 no-progress")
+    expect(formatLoopState(makeState({ rounds: 2, running: true, consecutiveDry: 2 }))).toBe(
+      "CYCLE #2(running 2 no-progress)",
+    )
+    expect(formatLoopState(makeState({ rounds: 3, paused: true, consecutiveDry: 3 }))).toBe(
+      "CYCLE #3(paused, 3 no-progress)",
+    )
   })
 })

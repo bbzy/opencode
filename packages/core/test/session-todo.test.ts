@@ -57,11 +57,13 @@ describe("SessionTodo", () => {
         todos: [
           { content: "second", status: "pending", priority: "low" },
           { content: "first", status: "in_progress", priority: "high" },
+          { content: "device check — unblock when the user tests it", status: "blocked", priority: "high" },
         ],
       })
       expect(yield* todos.get(sessionID)).toEqual([
         { content: "second", status: "pending", priority: "low" },
         { content: "first", status: "in_progress", priority: "high" },
+        { content: "device check — unblock when the user tests it", status: "blocked", priority: "high" },
       ])
       expect(
         (yield* db.select().from(TodoTable).orderBy(asc(TodoTable.position)).all().pipe(Effect.orDie)).map((row) => ({
@@ -71,6 +73,7 @@ describe("SessionTodo", () => {
       ).toEqual([
         { content: "second", position: 0 },
         { content: "first", position: 1 },
+        { content: "device check — unblock when the user tests it", position: 2 },
       ])
 
       yield* todos.update({ sessionID, todos: [{ content: "replacement", status: "completed", priority: "medium" }] })
@@ -84,6 +87,7 @@ describe("SessionTodo", () => {
           todos: [
             { content: "second", status: "pending", priority: "low" },
             { content: "first", status: "in_progress", priority: "high" },
+            { content: "device check — unblock when the user tests it", status: "blocked", priority: "high" },
           ],
         },
         { sessionID, todos: [{ content: "replacement", status: "completed", priority: "medium" }] },

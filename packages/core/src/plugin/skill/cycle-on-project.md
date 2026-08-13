@@ -112,9 +112,10 @@ A round prompt (`[Cycle #N] Automated cycle — iteration N. ...`) is the schedu
 
 Round prompts may carry extra context lines:
 
-- **Last completed iteration** — the tail of your own previous round report. Use it as ground truth for where the loop stands; do not re-verify work it says was done.
+- **Chaos assessment** — selected rounds ask for a `CYCLE_CHAOS` block that scores session-history health. Judge ambiguity, obsolete history, contradictions, execution drift, and context pressure rather than project difficulty or remaining workload. This is observational telemetry; continue the responsible-owner workflow normally.
 - **Idle status** — how many consecutive rounds produced neither durable changes nor new validation evidence before the scheduler challenges the loop's depth. At the threshold, the next round explicitly challenges you to run Reflect; if that round also produces no work, subsequent rounds escalate to Plan. Plan gets a bounded number of dry rounds: widen your view, generate higher-level candidates, and select one yourself. If that audit still finds no viable work, report the structured exhausted or blocked outcome described under Termination; the scheduler pauses after confirmation. A new successful validation command is evidence once, but repeating the same green check is idle.
 - **Unfinished todos** — the session todo list's pending/in-progress items, when any exist. This is your own backlog talking back to you: resolve every item or explicitly close it with a one-line reason before the turn ends. A DONE that contradicts a dirty todo list is not DONE.
+- **Blocked todos** — a blocked work item records its external dependency and unblock condition but does not stop the owner from selecting another valuable candidate. `CYCLE_OUTCOME: blocked` describes the whole responsibility scope, not one task: use it only after Check, Reflect, and Plan find no worthwhile independently actionable work.
 - **Duplicate-delivery note** — the scheduler deduplicates rounds, but if a prompt names an iteration you already completed, treat it as a duplicate: confirm briefly and end the turn without redoing anything. Never invent your own iteration numbering — trust the `[Cycle #N]` in the prompt over your memory of "which cycle this is".
 
 ### Phase 1 — Do Tasks
@@ -162,7 +163,7 @@ If all checks pass, proceed to Phase 3.
 
 Reflection is what separates a responsible owner from a task-execution machine. After the work is done and checked, step back and think critically.
 
-Reflect on these dimensions:
+Reflect on these dimensions, then compare every surviving concern with the existing backlog before acting. A newly discovered concern is a candidate, not an automatic top priority. Rank by user impact, risk, blocking value, cost, available evidence, and authorization:
 
 1. **Task quality.** Was the task done well? Not just "does it work" — is the design sound? Is the code clean? Is it maintainable? Would you be proud to show this to another engineer?
 2. **Test coverage.** Think beyond "did I write tests." Are the _right_ things tested? Are there scenarios you didn't think of during implementation that surfaced during review? Is the coverage honest, or are there disguised gaps?
@@ -194,6 +195,8 @@ Consider improvements across four dimensions:
 - **Code quality** — Whether the code is healthy to live with. Technical debt, fragile or hard-to-maintain code, deviations from project conventions, missing or drifting documentation, architecture that no longer fits, duplication that accumulated over time. Also includes how changes are packaged for review: commit organization, commit-message clarity, and the self-review of diffs.
 
 Generate 2-5 concrete, specific candidate tasks. Each should be small enough to complete in one Do-phase cycle. "Refactor the entire auth module" is too big; "Extract token validation into a separate function and add tests for the expired-token path" is right.
+
+Do not invent work merely to remain active. A project can contain possible improvements without any being valuable enough for another round. Reject candidates whose value, certainty, authorization, or benefit-to-cost ratio does not justify the work, and record the reason.
 
 Evaluate priority yourself and pick the one to do next. Priority heuristic (higher beats lower):
 
@@ -230,13 +233,13 @@ When stopping:
 4. If the user said stop in chat but the scheduler may still be active, remind them once to run `/cycle stop` — otherwise round prompts will keep waking you. You cannot run it yourself.
 5. Exit loop mode.
 
-Never remove the cycle yourself or invent low-value work merely to keep it busy. DONE is a verdict you must be able to defend and is only legal when all three hold:
+Never remove the cycle yourself or invent low-value work merely to keep it busy. Before every round ends, reconcile the todo list with the report: complete achieved items, mark externally waiting items `blocked` with the unblock condition in their content, add material candidates, and explicitly close stale ones. An outcome is a verdict you must be able to defend and is only legal when all three hold:
 
-1. **The todo list is clean** — no pending or in-progress items; every entry is completed (with its goal actually achieved) or explicitly closed with a one-line reason.
+1. **No actionable todo remains** — no pending or in-progress item remains. An exhausted verdict also requires every blocked item to be completed or explicitly closed; a blocked verdict may preserve blocked items with their unblock conditions.
 2. **Every fix made during the loop is verified** — each committed change passed the strongest available check (Ironclad Rule 7). If verification is blocked, the loop's next work is building a verification path, not DONE.
 3. **This cycle's Plan phase ran and produced its candidate list** — and every candidate was rejected with a one-line reason recorded in session state.
 
-When all three hold and the only "work" left is re-running green checks and re-reading clean diffs, report DONE with a one-line justification and end with exactly `CYCLE_OUTCOME: exhausted`. Use `CYCLE_OUTCOME: blocked` instead when the only remaining work needs external input, authorization, or an unavailable environment. The scheduler asks a later round to audit the first verdict independently and auto-pauses after the second confirmation. Do not emit either marker while a todo, unverified fix, or viable candidate remains. Otherwise continue immediately: close out the todos, build the missing verification path, or execute the chosen candidate.
+When all three hold and no remaining candidate has enough value, certainty, authorization, or benefit-to-cost ratio to justify another round, report DONE with a one-line justification and end with exactly `CYCLE_OUTCOME: exhausted`. Use `CYCLE_OUTCOME: blocked` instead only when every worthwhile path in the responsibility scope requires external input, authorization, or an unavailable environment. The scheduler asks a later round to audit the first verdict independently and auto-pauses after the second confirmation. Do not emit either marker while an actionable todo, unverified fix, or worthwhile viable candidate remains. Otherwise continue immediately: close out the todos, build the missing verification path, or execute the chosen candidate.
 
 ## Compaction Resilience
 

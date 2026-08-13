@@ -2963,6 +2963,8 @@ noLLMServer.instance(
       expect((text as SessionV1.TextPart)?.text).toContain("pause")
       expect((text as SessionV1.TextPart)?.text).toContain("resume")
       expect((text as SessionV1.TextPart)?.text).toContain("status")
+      expect((text as SessionV1.TextPart)?.text).not.toContain("--reset")
+      expect((text as SessionV1.TextPart)?.text).not.toContain("/cycle reset")
       expect((text as SessionV1.TextPart)?.text).toContain("Examples:")
       expect((text as SessionV1.TextPart)?.text).toContain("Intervals:")
     }),
@@ -3079,6 +3081,39 @@ it.instance(
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
       } finally {
         loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "cycle injects a soft checkpoint instruction at the provider-turn budget",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalBudget = loopConfig.maxRoundProviderTurns
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxRoundProviderTurns = 2
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot({ title: "Cycle checkpoint" })
+        yield* llm.tool("glob", { pattern: "**/*.txt" })
+        yield* llm.text(`Checkpointed.
+CYCLE_PROGRESS
+kind: diagnosed
+goal: inspect text files
+evidence: glob completed and the current atomic investigation ended`)
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "100ms" })
+        yield* llm.wait(2)
+        const inputs = yield* llm.inputs
+        expect(JSON.stringify(inputs.at(-1)?.messages)).toContain(
+          "This unattended cycle round has reached its soft provider-turn budget",
+        )
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        loopConfig.maxRoundProviderTurns = originalBudget
       }
     }),
   { config: cfg },
@@ -3262,7 +3297,7 @@ it.instance(
           arguments: "status",
         })
         const statusText = (statusResult.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
-        expect(statusText).toContain("4 consecutive idle iterations (plan)")
+        expect(statusText).toContain("4 consecutive no-progress iterations (plan)")
 
         const stateMap = yield* prompt.loopState()
         const state = stateMap[chat.id]
@@ -3407,6 +3442,64 @@ it.instance(
 )
 
 it.instance(
+  "blocked todos remain visible without preventing a scope-level blocked outcome",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalMaxDry = loopConfig.maxDryIterations
+      loopConfig.minIntervalMs = 100
+      loopConfig.maxDryIterations = 10
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        const todos = yield* Todo.Service
+        yield* todos.update({
+          sessionID: chat.id,
+          todos: [
+            {
+              content: "Device acceptance — unblock when the user tests the live preview",
+              status: "blocked",
+              priority: "high",
+            },
+          ],
+        })
+        yield* llm.text(`No worthwhile independently actionable work remains.
+CYCLE_PROGRESS
+kind: none
+goal: preserve device acceptance
+evidence: the only remaining item requires the user's device action
+CYCLE_OUTCOME: blocked`)
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
+        yield* llm.wait(2)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const state = (yield* prompt.loopState())[chat.id]
+            return state?.paused ? (true as const) : undefined
+          }),
+          "cycle never paused after two scope-level blocked outcomes",
+          "10 seconds",
+        )
+        const inputs = JSON.stringify(yield* llm.inputs)
+        expect(inputs).toContain("Blocked tasks (1)")
+        expect(inputs).toContain("unblock when the user tests the live preview")
+        expect(yield* todos.get(chat.id)).toEqual([
+          {
+            content: "Device acceptance — unblock when the user tests the live preview",
+            status: "blocked",
+            priority: "high",
+          },
+        ])
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        loopConfig.maxDryIterations = originalMaxDry
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
   "materially identical cross-round responses auto-pause the cycle",
   () =>
     Effect.gen(function* () {
@@ -3442,7 +3535,7 @@ it.instance(
 )
 
 it.instance(
-  "round prompts carry the previous round summary and idle status",
+  "round prompts omit the previous response and request periodic chaos assessment",
   () =>
     Effect.gen(function* () {
       const originalMin = loopConfig.minIntervalMs
@@ -3451,21 +3544,64 @@ it.instance(
         const { llm } = yield* useServerConfig(providerCfg)
         const { prompt, chat } = yield* boot()
         yield* llm.text("fixed the widget")
+        yield* llm.text("checked the widget")
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
-        yield* llm.wait(2)
+        yield* llm.wait(3)
         const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
-        const round2 = msgs.find(
+        const round3 = msgs.find(
           (msg) =>
             msg.info.role === "user" &&
-            msg.parts.some((part) => part.type === "text" && part.text.includes("[Cycle #2]")),
+            msg.parts.some((part) => part.type === "text" && part.text.includes("[Cycle #3]")),
         )
-        const text = round2?.parts.find((part) => part.type === "text")
+        const text = round3?.parts.find((part) => part.type === "text")
         expect(text?.type).toBe("text")
         if (text?.type !== "text") return
-        expect(text.text).toContain("Last completed iteration: #1 — fixed the widget")
-        expect(text.text).toContain("Idle status: 1/3")
+        expect(text.text).not.toContain("Last completed iteration")
+        expect(text.text).toContain("CYCLE_CHAOS")
         expect(text.text).toContain("duplicate delivery")
         expect(text.text).toContain("DONE")
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "cycle records a requested chaos assessment for status inspection",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, chat } = yield* boot()
+        yield* llm.text("No durable progress this round.")
+        yield* llm.text(`Assessment complete.
+CYCLE_CHAOS
+state_clarity: 3
+history_noise: 3
+conflict_drift: 2
+execution_continuity: 2
+context_pressure: 3
+reason: The state is recoverable but noisy.`)
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 1s" })
+        yield* llm.wait(2)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const state = (yield* prompt.loopState())[chat.id]
+            return state?.rounds === 2 && !state.running ? (true as const) : undefined
+          }),
+          "second cycle round never completed",
+          "5 seconds",
+        )
+        const result = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "status" })
+        const text = result.parts.find((part) => part.type === "text")
+        expect(text?.type).toBe("text")
+        if (text?.type !== "text") return
+        expect(text.text).toContain("chaos 65/100 assessed at round 2")
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
       } finally {
         loopConfig.minIntervalMs = originalMin
@@ -3618,7 +3754,7 @@ it.instance(
           arguments: "status",
         })
         const statusText = (statusResult.parts.find((p) => p.type === "text") as SessionV1.TextPart)?.text ?? ""
-        expect(statusText).toContain("1 consecutive idle iterations (idle)")
+        expect(statusText).toContain("1 consecutive no-progress iterations (tracking)")
 
         const stateMap = yield* prompt.loopState()
         const state = stateMap[chat.id]
