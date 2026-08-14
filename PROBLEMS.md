@@ -134,7 +134,7 @@ Cycle 有权主动发现并创建任务，但不能通过不断创建低价值�
 
 ## 11. 单轮可能无限膨胀
 
-**当前状态：部分解决。达到 `loopConfig.maxRoundProviderTurns` 后会注入软 checkpoint 指令，要求完成当前原子操作并让出下一轮；不会打断在途工具，也没有硬性时长或 token 上限。**
+**当前状态：已解决 provider-turn 失控。达到 `loopConfig.maxRoundProviderTurns` 时注入收尾提示，下一 turn 禁用工具并强制结束本轮；在途工具不被轮次边界打断。另有 unattended 工具总时限作为兜底。尚未增加 round token 上限。**
 
 真实 session 中已经出现单轮包含 85 个 assistant provider turn、持续约一小时的情况。即使每一步都有意义，过长 round 仍会：
 
@@ -173,6 +173,22 @@ Cycle 需要能够诚实拒绝候选并记录理由，而不是为了保持运�
 ## 16. 混沌评分未进入公开 LoopEvent
 
 **当前状态：观测阶段有意保持内部。评分存在于进程内 `LoopState`、日志和 `/cycle status`，TUI/footer 与外部客户端暂不可见。若真实数据校准需要跨进程采集，应单独设计公开事件字段。**
+
+## 17. 后台子进程可绕过 shell timeout
+
+**当前状态：已解决。shell timeout/abort 在终止命令后会主动中断输出读取 fiber，避免 detached descendant 持有 pipe 导致 scope 永久无法关闭；processor 同时对所有 unattended tool 设置总执行时限。**
+
+## 18. 用户 intervention 可能被记为空响应
+
+**当前状态：已解决。Cycle worker 会检查本轮 prompt 之后实际 admitted 的用户消息和 aborted assistant；用户 steer 会暂停 Cycle、让用户 drain 优先，不增加 empty/failure 计数。**
+
+## 19. blocked 二次审计会降低授权边界
+
+**当前状态：已解决提示词约束。第二次确认仅允许低成本只读复核；没有新证据或外部条件变化时保留 unblock condition，不得把用户物理操作、账号访问或外部 UI 控制重新解释成自主授权。**
+
+## 20. 模型混沌自评会美化恢复事故
+
+**当前状态：已缓解。引擎现在按单轮 provider turns、工具数/错误、时长、上下文利用率和破坏性操作校准各维度下限；模型仍负责解释原因。阈值和权重仍需更多真实 session 校准。**
 
 ## 约束
 
