@@ -1057,6 +1057,24 @@ describe("tool.shell abort", () => {
     15_000,
   )
 
+  if (process.platform !== "win32") {
+    it.live(
+      "returns after timeout when a background descendant keeps the output pipe open",
+      () =>
+        runIn(
+          projectRoot,
+          Effect.gen(function* () {
+            const result = yield* run({
+              command: `sh -c 'sleep 60 &' && sleep 60`,
+              timeout: 500,
+            })
+            expect(result.output).toContain("shell tool terminated command after exceeding timeout")
+          }),
+        ),
+      15_000,
+    )
+  }
+
   it.live(
     "uses RuntimeFlags bashDefaultTimeoutMs when timeout is omitted",
     () =>

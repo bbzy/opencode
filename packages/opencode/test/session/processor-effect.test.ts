@@ -1300,6 +1300,39 @@ itToolInFlight.live("session.processor stall watchdog stays quiet while a tool i
   ),
 )
 
+itToolInFlight.live("session.processor stops an unattended tool that exceeds its execution limit", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const originalTimeout = SessionProcessor.processorConfig.unattendedToolTimeoutMs
+        const originalCheck = SessionProcessor.processorConfig.stallCheckMs
+        SessionProcessor.processorConfig.unattendedToolTimeoutMs = 200
+        SessionProcessor.processorConfig.stallCheckMs = 50
+        try {
+          const { processors, session, provider } = yield* boot()
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "hi")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+            unattended: true,
+          })
+
+          const value = yield* handle.process(stallInput(parent, chat.id, mdl))
+          expect(value).toBe("stop")
+          expect(JSON.stringify(handle.message.error)).toContain("Unattended tool exceeded")
+        } finally {
+          SessionProcessor.processorConfig.unattendedToolTimeoutMs = originalTimeout
+          SessionProcessor.processorConfig.stallCheckMs = originalCheck
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
 itDoom.live("session.processor circuit breaker stops a cross-step doom loop", () =>
   provideTmpdirInstance(
     (dir) =>

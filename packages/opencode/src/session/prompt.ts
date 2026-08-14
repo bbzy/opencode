@@ -1115,6 +1115,15 @@ const layer = Layer.effect(
       const message = yield* createUserMessage(input)
       yield* sessions.touch(input.sessionID)
 
+      if (input.noReply === true) {
+        const parts = yield* Effect.forEach(message.parts, (part): Effect.Effect<SessionV1.Part> =>
+          part.type === "text"
+            ? sessions.updatePart({ ...part, synthetic: true }).pipe(Effect.map((updated) => updated as SessionV1.Part))
+            : Effect.succeed(part),
+        )
+        return { info: message.info, parts }
+      }
+
       const permissions: PermissionV1.Rule[] = []
       for (const [t, enabled] of Object.entries(input.tools ?? {})) {
         permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
@@ -1124,7 +1133,6 @@ const layer = Layer.effect(
         yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
       }
 
-      if (input.noReply === true) return message
       const activeLoop = activeCycles.get(input.sessionID)
       if (activeLoop) {
         while (true) {
@@ -1298,7 +1306,7 @@ const layer = Layer.effect(
               const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
               const promptOps = yield* ops()
 
-              const tools = yield* SessionTools.resolve({
+              const resolvedTools = yield* SessionTools.resolve({
                 agent,
                 session,
                 model,
@@ -1315,6 +1323,9 @@ const layer = Layer.effect(
                 Effect.provideService(Truncate.Service, truncate),
                 Effect.provideService(RuntimeFlags.Service, flags),
               )
+
+              const mustYield = options?.unattended && Loop.roundMustYield(step)
+              const tools = mustYield ? {} : resolvedTools
 
               if (lastUser.format?.type === "json_schema") {
                 tools["StructuredOutput"] = createStructuredOutputTool({
@@ -1349,7 +1360,9 @@ const layer = Layer.effect(
               if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
               if (options?.unattended && Loop.roundNeedsCheckpoint(step))
                 system.push(
-                  `This unattended cycle round has reached its soft provider-turn budget. Do not start another task or investigation branch. Finish only the current atomic operation, update the todo list, report the evidence obtained, include the required CYCLE_PROGRESS and CYCLE_CHAOS blocks when requested, then end the response. Leave unfinished work for the next scheduled round.`,
+                  mustYield
+                    ? `This unattended cycle round is at its final tool-free checkpoint. Do not call tools or continue the investigation. Reconcile todos from the evidence already obtained, report CYCLE_PROGRESS and CYCLE_CHAOS when requested, leave unfinished work for the next scheduled round, and end the response now.`
+                    : `This unattended cycle round has reached its provider-turn budget. Do not start another task or investigation branch. Finish only the current atomic operation, update the todo list, report the evidence obtained, include the required CYCLE_PROGRESS and CYCLE_CHAOS blocks when requested, then end the response. The next provider turn will be tool-free and will end the round.`,
                 )
               const enforceMarker =
                 system.some((s) => s.includes(COMPLETION_MARKER)) ||
@@ -1375,6 +1388,8 @@ const layer = Layer.effect(
                 model,
                 toolChoice: format.type === "json_schema" ? "required" : undefined,
               })
+
+              if (mustYield) return "break" as const
 
               if (structured !== undefined) {
                 handle.message.structured = structured
@@ -1839,6 +1854,7 @@ const layer = Layer.effect(
           const contextUsage = yield* cycleContextUsage(input.sessionID).pipe(
             Effect.catchCause(() => Effect.succeed(0)),
           )
+          const roundStartedAt = Date.now()
           const exit = yield* Effect.gen(function* () {
             const fullPrompt = buildPrompt(
               round,
@@ -1863,16 +1879,33 @@ const layer = Layer.effect(
               },
               { unattended: true },
             )
-            // The boundary check alone misses mid-round aborts: onInterrupt
-            // resolves with the current round's own aborted assistant message,
-            // which is newer than the boundary.
-            const aborted = result.info.role === "assistant" && result.info.error?.name === "MessageAbortedError"
-            const interrupted = aborted || (boundaryId ? result.info.id <= boundaryId : false)
-            return { fullPrompt, boundaryId, result, interrupted }
+            const after = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+            const cyclePrompt = after.find(
+              (message) =>
+                message.info.role === "user" &&
+                message.parts.some((part) => part.type === "text" && part.text === fullPrompt),
+            )
+            const admitted = cyclePrompt
+              ? after.filter((message) => message.info.time.created >= cyclePrompt.info.time.created)
+              : after.filter((message) => !boundaryId || message.info.id > boundaryId)
+            // A user message admitted while an unattended drain owns the
+            // Session is an explicit intervention even if the runner returns
+            // a different empty/aborted assistant at the end of the race.
+            const intervened = admitted.some(
+              (message) =>
+                message.info.role === "user" &&
+                message.info.id !== cyclePrompt?.info.id &&
+                message.parts.some((part) => part.type === "text" && part.synthetic !== true),
+            )
+            const aborted = admitted.some(
+              (message) => message.info.role === "assistant" && message.info.error?.name === "MessageAbortedError",
+            )
+            const interrupted = intervened || aborted || (boundaryId ? result.info.id <= boundaryId : false)
+            return { fullPrompt, boundaryId, result, interrupted, intervened }
           }).pipe(
             Effect.map((data) =>
               data.interrupted
-                ? { _tag: "interrupted" as const, fullPrompt: data.fullPrompt }
+                ? { _tag: "interrupted" as const, fullPrompt: data.fullPrompt, intervened: data.intervened }
                 : { _tag: "success" as const, ...data },
             ),
             Effect.catchTag("SessionBusyError", () => Effect.succeed({ _tag: "coalesced" as const })),
@@ -2000,7 +2033,13 @@ const layer = Layer.effect(
             } else {
               current.consecutiveDry++
             }
-            const chaos = Loop.chaosAssessment(response)
+            const chaos = Loop.chaosAssessment(
+              response,
+              Loop.roundObservations(roundMsgs, exit.boundaryId, {
+                durationMs: Date.now() - roundStartedAt,
+                contextUsage,
+              }),
+            )
             if (chaos) {
               current.lastChaos = { round, ...chaos }
               yield* Effect.logInfo("cycle chaos assessed", {
@@ -2056,11 +2095,13 @@ const layer = Layer.effect(
             current.consecutiveExhausted = 0
             current.consecutiveDuplicateResponses = 0
             current.lastResponseFingerprint = undefined
-            yield* noReply(
-              input.sessionID,
-              undefined,
-              `[${word} #${round}] Iteration interrupted; cycle paused. Use /cycle resume to continue.`,
-            )
+            if (!exit.intervened)
+              yield* noReply(
+                input.sessionID,
+                undefined,
+                `[${word} #${round}] Iteration interrupted; cycle paused. Use /cycle resume to continue.`,
+              )
+            yield* publishCycleState(input.sessionID, current).pipe(Effect.ignore)
           } else {
             const pretty = Cause.pretty(exit.cause)
             if (isFatalEnvironmentError({ message: pretty })) {

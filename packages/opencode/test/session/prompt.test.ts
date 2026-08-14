@@ -1298,7 +1298,7 @@ it.instance(
       loopConfig.minIntervalMs = 100
       try {
         const { llm } = yield* useServerConfig(providerCfg)
-        const { prompt, chat } = yield* boot()
+        const { prompt, sessions, chat } = yield* boot()
 
         // Hold round 1's LLM response so the round takes ~500ms to complete.
         const gate = yield* Deferred.make<void>()
@@ -3088,13 +3088,13 @@ it.instance(
 )
 
 it.instance(
-  "cycle injects a soft checkpoint instruction at the provider-turn budget",
+  "cycle makes the grace provider turn tool-free and ends the round",
   () =>
     Effect.gen(function* () {
       const originalMin = loopConfig.minIntervalMs
       const originalBudget = loopConfig.maxRoundProviderTurns
       loopConfig.minIntervalMs = 100
-      loopConfig.maxRoundProviderTurns = 2
+      loopConfig.maxRoundProviderTurns = 1
       try {
         const { llm } = yield* useServerConfig(providerCfg)
         const { prompt, chat } = yield* boot({ title: "Cycle checkpoint" })
@@ -3108,8 +3108,10 @@ evidence: glob completed and the current atomic investigation ended`)
         yield* llm.wait(2)
         const inputs = yield* llm.inputs
         expect(JSON.stringify(inputs.at(-1)?.messages)).toContain(
-          "This unattended cycle round has reached its soft provider-turn budget",
+          "This unattended cycle round is at its final tool-free checkpoint",
         )
+        expect(inputs).toHaveLength(2)
+        expect(inputs.at(-1)?.tools).toBeUndefined()
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
       } finally {
         loopConfig.minIntervalMs = originalMin
@@ -3772,7 +3774,7 @@ it.instance(
 )
 
 it.instance(
-  "/cycle does not count apply_patch rounds as dry",
+  "/cycle counts file-only apply_patch activity as dry",
   () =>
     Effect.gen(function* () {
       const originalMin = loopConfig.minIntervalMs
@@ -3822,11 +3824,12 @@ it.instance(
           "10 seconds",
         )
 
-        // Round 1 modified a file via apply_patch (dry resets), round 2 got the
-        // auto "ok" response with no tools (dry increments to exactly 1).
+        // File mutation is activity rather than evidence: without a valid
+        // CYCLE_PROGRESS declaration backed by validation/commit/diagnosis or
+        // a todo transition, both rounds are dry.
         const dry = (yield* prompt.loopState())[chat.id].consecutiveDry
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
-        expect(dry).toBe(1)
+        expect(dry).toBe(2)
       } finally {
         loopConfig.minIntervalMs = originalMin
       }
@@ -4063,6 +4066,70 @@ it.instance(
           "10 seconds",
         )
 
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
+  "/cycle pauses when a user prompt steers an active unattended round",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      loopConfig.minIntervalMs = 100
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, sessions, chat } = yield* boot()
+        const gate = yield* Deferred.make<void>()
+        yield* llm.hold("cycle response", deferredAsPromise(gate))
+        yield* llm.text("user response")
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 200ms" })
+        yield* llm.wait(1)
+        const user = yield* prompt
+          .prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "I am back" }] })
+          .pipe(Effect.forkChild)
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const admitted = (yield* sessions.messages({ sessionID: chat.id })).some((message) =>
+              message.parts.some((part) => part.type === "text" && part.text === "I am back"),
+            )
+            return admitted ? (true as const) : undefined
+          }),
+          "user steer was not admitted during the active round",
+          "10 seconds",
+        )
+        yield* Deferred.succeed(gate, void 0)
+
+        const result = yield* Fiber.join(user)
+        const userMessage = (yield* sessions.messages({ sessionID: chat.id })).find((message) =>
+          message.parts.some((part) => part.type === "text" && part.text === "I am back"),
+        )
+        if (!userMessage) throw new Error("expected admitted user steer")
+        expect(result.info.role).toBe("assistant")
+        if (result.info.role === "assistant") {
+          expect(result.info.parentID).toBe(userMessage.info.id)
+          expect(result.info.error).toBeUndefined()
+        }
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const state = (yield* prompt.loopState())[chat.id]
+            return state?.paused ? (true as const) : undefined
+          }),
+          "cycle never paused after the user steered the active round",
+          "10 seconds",
+        )
+        const state = (yield* prompt.loopState())[chat.id]
+        expect(state.paused).toBe(true)
+        expect(
+          (yield* sessions.messages({ sessionID: chat.id })).some((message) =>
+            message.parts.some((part) => part.type === "text" && part.text.includes("Empty response from provider")),
+          ),
+        ).toBe(false)
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
       } finally {
         loopConfig.minIntervalMs = originalMin

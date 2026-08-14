@@ -34,6 +34,10 @@ export const processorConfig = {
   // flight) is treated as hung: the turn fails instead of waiting forever.
   stallTimeoutMs: 10 * 60 * 1000,
   stallCheckMs: 30 * 1000,
+  // An unattended tool can keep the stream alive forever while holding the
+  // whole Session drain. Individual tools should still enforce tighter
+  // limits; this is the process-level backstop for every tool implementation.
+  unattendedToolTimeoutMs: 20 * 60 * 1000,
   // Identical tool call (same tool + same input) this many times in a row,
   // across steps, hard-stops the turn. The interactive doom-loop permission
   // (DOOM_LOOP_THRESHOLD, single step) auto-allows in unattended sessions,
@@ -89,6 +93,7 @@ type ToolCall = {
   messageID: SessionV1.ToolPart["messageID"]
   sessionID: SessionV1.ToolPart["sessionID"]
   done: Deferred.Deferred<void>
+  startedAt?: number
 }
 
 interface ProcessorContext extends Input {
@@ -136,6 +141,7 @@ const layer = Layer.effect(
         assistantMessage: input.assistantMessage,
         sessionID: input.sessionID,
         model: input.model,
+        unattended: input.unattended,
         toolcalls: {},
         shouldBreak: false,
         snapshot: initialSnapshot,
@@ -383,6 +389,8 @@ const layer = Layer.effect(
                 ? { ...value.providerMetadata, providerExecuted: true }
                 : value.providerMetadata,
             }))
+            const running = ctx.toolcalls[value.id]
+            if (running && running.startedAt === undefined) running.startedAt = Date.now()
 
             // Cross-step doom-loop circuit breaker: the per-step permission
             // check below auto-allows in unattended sessions, so an identical
@@ -709,7 +717,21 @@ const layer = Layer.effect(
             const stallWatch = Effect.gen(function* () {
               while (true) {
                 yield* Effect.sleep(Duration.millis(processorConfig.stallCheckMs))
-                if (Object.keys(ctx.toolcalls).length > 0) continue
+                const tools = Object.values(ctx.toolcalls)
+                const expired =
+                  ctx.unattended &&
+                  tools.find(
+                    (tool) =>
+                      tool.startedAt !== undefined &&
+                      Date.now() - tool.startedAt > processorConfig.unattendedToolTimeoutMs,
+                  )
+                if (expired)
+                  return yield* Effect.fail(
+                    new Error(
+                      `Unattended tool exceeded the ${Math.round(processorConfig.unattendedToolTimeoutMs / 1000)}s execution limit`,
+                    ),
+                  )
+                if (tools.length > 0) continue
                 if (Date.now() - ctx.lastEventAt <= processorConfig.stallTimeoutMs) continue
                 return yield* Effect.fail(
                   new Error(
