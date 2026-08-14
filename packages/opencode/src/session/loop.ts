@@ -27,9 +27,9 @@ export const loopConfig = {
   // Chaos is sampled periodically, and immediately when the scheduler has
   // already observed a risk signal such as a no-progress round.
   chaosAssessmentInterval: 3,
-  // A cycle round should land one verifiable unit and yield. This is a soft
-  // provider-turn boundary: the model receives a checkpoint instruction but
-  // in-flight tools are never interrupted.
+  // A cycle round should land one verifiable unit and yield. The final grace
+  // turn has no tools and is ended by the engine, so in-flight tools are never
+  // interrupted but the model cannot expand the round indefinitely.
   maxRoundProviderTurns: 20,
 }
 
@@ -41,10 +41,13 @@ export const FILE_MODIFY_TOOLS = new Set(["edit", "write", "apply_patch"])
 // rewording) are misjudged as idle. Read-only subcommands (st/log/diff/
 // status/bookmark list) deliberately don't match.
 const VCS_MUTATION_PATTERN =
-  /\b(?:jj|git)\s+(?:commit|split|squash|describe|abandon|rebase|new|merge|cherry-pick|revert|restore|reset|amend|undo|tag|bookmark\s+(?:move|create|delete|set|rename|track|untrack|forget))\b/
+  /\b(?:jj|git)\s+(?:commit|split|squash|desc(?:ribe)?|abandon|rebase|new|merge|cherry-pick|revert|restore|reset|amend|undo|tag|bookmark\s+(?:move|create|delete|set|rename|track|untrack|forget))\b/
 
 const VALIDATION_PATTERN =
-  /(?:^|(?:&&|;|\|)\s*)(?:bun\s+(?:test|typecheck|run\s+(?:test|typecheck|lint|check|build))|npm\s+(?:test|run\s+(?:test|typecheck|lint|check|build))|pnpm\s+(?:test|run\s+(?:test|typecheck|lint|check|build))|yarn\s+(?:test|typecheck|lint|check|build)|cargo\s+(?:test|check|clippy|build)|go\s+test|pytest|ctest|cmake\s+--build|(?:\.\/)?gradlew?\s+[^;&|]*(?:test|check|lint|assemble|build)|make\s+(?:test|check|lint|build)|ninja(?:\s|$))/i
+  /(?:^|(?:&&|;|\|)\s*)(?:(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+)*)(?:bun\s+(?:test|typecheck|run\s+(?:test|typecheck|lint|check|build))|npm\s+(?:test|run\s+(?:test|typecheck|lint|check|build))|pnpm\s+(?:test|run\s+(?:test|typecheck|lint|check|build))|yarn\s+(?:test|typecheck|lint|check|build)|cargo\s+(?:test|check|clippy|build)|go\s+test|pytest|ctest|cmake\s+--build|(?:\.\/)?gradlew?\s+[^;&|]*(?:test|check|lint|assemble|build)|make\s+(?:test|check|lint|build)|ninja(?:\s|$))/i
+
+const DESTRUCTIVE_OPERATION_PATTERN =
+  /(?:\brsync\b[^;&|]*\s--delete\b|\bgit\s+(?:checkout|reset)\b|\brm\s+[^;&|]*(?:-[A-Za-z]*r|--recursive)\b)/i
 
 function completedCommand(part: SessionV1.Part) {
   if (part.type !== "tool" || part.tool !== "bash" || part.state?.status !== "completed") return
@@ -108,17 +111,14 @@ export function roundMadeProgress(
   const validated = commands.some((command) => VALIDATION_PATTERN.test(command) && !previousValidations.has(command))
   const declared = roundProgress(response)
   if (!declared || declared.kind === "none") return false
-  if (declared.kind === "committed") return committed
-  if (declared.kind === "validated") return validated
-  if (declared.kind === "todo") return todoChanged && parts.some((part) => part.tool === "todowrite")
-  if (declared.kind === "diagnosed")
-    return parts.some(
-      (part) =>
-        !FILE_MODIFY_TOOLS.has(part.tool) &&
-        part.tool !== "todowrite" &&
-        !previousTools.has(completedToolSignature(part)!),
-    )
-  return false
+  const todo = todoChanged && parts.some((part) => part.tool === "todowrite")
+  const diagnosed = parts.some(
+    (part) =>
+      !FILE_MODIFY_TOOLS.has(part.tool) &&
+      part.tool !== "todowrite" &&
+      !previousTools.has(completedToolSignature(part)!),
+  )
+  return committed || validated || todo || diagnosed
 }
 
 export type RoundOutcome = "exhausted" | "blocked"
@@ -137,7 +137,6 @@ export function eligibleRoundOutcome(response: string, todos: readonly { status:
   const outcome = roundOutcome(response)
   if (todos.some((item) => item.status !== "completed" && item.status !== "cancelled" && item.status !== "blocked"))
     return
-  if (outcome === "exhausted" && todos.some((item) => item.status === "blocked")) return
   return outcome
 }
 
@@ -195,6 +194,15 @@ export type ChaosAssessment = {
   reason?: string
 }
 
+export type RoundObservations = {
+  providerTurns?: number
+  toolCalls?: number
+  toolErrors?: number
+  durationMs?: number
+  contextUsage?: number
+  destructiveOperations?: number
+}
+
 const chaosDimensions = [
   ["state_clarity", "stateClarity", 7.5],
   ["history_noise", "historyNoise", 5],
@@ -203,7 +211,7 @@ const chaosDimensions = [
   ["context_pressure", "contextPressure", 2.5],
 ] as const
 
-export function chaosAssessment(response: string): ChaosAssessment | undefined {
+export function chaosAssessment(response: string, observations: RoundObservations = {}): ChaosAssessment | undefined {
   const marker = response.lastIndexOf("CYCLE_CHAOS")
   if (marker < 0) return
   const block = response.slice(marker)
@@ -215,13 +223,29 @@ export function chaosAssessment(response: string): ChaosAssessment | undefined {
   ) as Partial<Record<(typeof chaosDimensions)[number][1], number>>
   if (chaosDimensions.some(([, key]) => values[key] === undefined)) return
   const reason = block.match(/^reason:\s*(.+)$/im)?.[1]?.trim()
-  return {
-    score: chaosDimensions.reduce((total, [, key, weight]) => total + values[key]! * weight, 0),
-    stateClarity: values.stateClarity!,
-    historyNoise: values.historyNoise!,
+  const scale = Math.max(observations.providerTurns ?? 0, observations.toolCalls ?? 0)
+  const calibrated = {
+    stateClarity: Math.max(values.stateClarity!, (observations.destructiveOperations ?? 0) > 0 ? 2 : 0),
+    historyNoise: Math.max(values.historyNoise!, scale >= 80 ? 2 : scale >= 40 ? 1 : 0),
     conflictDrift: values.conflictDrift!,
-    executionContinuity: values.executionContinuity!,
-    contextPressure: values.contextPressure!,
+    executionContinuity: Math.max(
+      values.executionContinuity!,
+      scale >= 80 || (observations.destructiveOperations ?? 0) > 0 ? 3 : scale >= 40 ? 2 : scale >= 20 ? 1 : 0,
+      (observations.durationMs ?? 0) >= 60 * 60 * 1000
+        ? 2
+        : (observations.durationMs ?? 0) >= 30 * 60 * 1000
+          ? 1
+          : 0,
+      (observations.toolErrors ?? 0) >= 3 ? 2 : (observations.toolErrors ?? 0) > 0 ? 1 : 0,
+    ),
+    contextPressure: Math.max(
+      values.contextPressure!,
+      (observations.contextUsage ?? 0) >= 0.7 ? 3 : (observations.contextUsage ?? 0) >= 0.5 ? 2 : 0,
+    ),
+  }
+  return {
+    score: Math.round(chaosDimensions.reduce((total, [, key, weight]) => total + calibrated[key] * weight, 0)),
+    ...calibrated,
     ...(reason ? { reason } : {}),
   }
 }
@@ -251,6 +275,30 @@ export function scheduleMode(): "cycle" {
 
 export function roundNeedsCheckpoint(providerTurns: number) {
   return providerTurns >= loopConfig.maxRoundProviderTurns
+}
+
+export function roundMustYield(providerTurns: number) {
+  return providerTurns > loopConfig.maxRoundProviderTurns
+}
+
+export function roundObservations(
+  messages: readonly { info: { id: string; role: string }; parts: readonly SessionV1.Part[] }[],
+  boundaryId: string | undefined,
+  input: { durationMs: number; contextUsage: number },
+): RoundObservations {
+  const current = messages.filter(
+    (message) => message.info.role === "assistant" && (!boundaryId || message.info.id > boundaryId),
+  )
+  const tools = current.flatMap((message) => message.parts).filter((part) => part.type === "tool")
+  const commands = tools.map(completedCommand).filter((command): command is string => !!command)
+  return {
+    providerTurns: current.length,
+    toolCalls: tools.length,
+    toolErrors: tools.filter((part) => part.state.status === "error").length,
+    durationMs: input.durationMs,
+    contextUsage: input.contextUsage,
+    destructiveOperations: commands.filter((command) => DESTRUCTIVE_OPERATION_PATTERN.test(command)).length,
+  }
 }
 
 // Cycle prompts omit "Next:" deliberately: the next round starts <interval>
@@ -288,7 +336,7 @@ export function buildCyclePrompt(
   }
   if (context?.consecutiveExhausted) {
     lines.push(
-      `The previous ${context.consecutiveExhausted} iteration(s) reported an exhausted or externally blocked outcome. Audit that verdict independently. Resume work if a viable candidate exists; otherwise confirm the outcome again.`,
+      `The previous ${context.consecutiveExhausted} iteration(s) reported an exhausted or externally blocked outcome. Confirm it with a low-cost, read-only review. Resume only if new evidence reveals a viable candidate inside the same authorization and safety boundary. Do not weaken a previously established blocker, reinterpret a user-required physical action as authorization to control their applications, or perform external UI/account actions merely to overturn the verdict. If external conditions have not changed, preserve the unblock condition and confirm the outcome.`,
     )
   }
   if (context?.assessChaos) {
@@ -318,16 +366,17 @@ export function buildCyclePrompt(
   if (context?.blockedTodos && context.blockedTodos.length > 0) {
     const todos = context.blockedTodos.slice(0, 10).map((content) => `"${content.slice(0, 120)}"`)
     lines.push(
-      `Blocked tasks (${context.blockedTodos.length}): ${todos.join(", ")}. A blocked task does not block the responsibility scope: preserve its unblock condition and choose another worthwhile in-scope candidate. Report CYCLE_OUTCOME: blocked only when Check, Reflect, and Plan confirm that the entire scope has no worthwhile independently actionable work.`,
+      `Blocked tasks (${context.blockedTodos.length}): ${todos.join(", ")}. A blocked task does not block the responsibility scope: preserve its unblock condition and choose another worthwhile in-scope candidate. Treat explicit user action, physical interaction, account access, external communication, and authorization requirements as hard boundaries until conditions actually change. Report CYCLE_OUTCOME: blocked only when Check, Reflect, and Plan confirm that the entire scope has no worthwhile independently actionable work.`,
     )
   }
   lines.push(
+    `Unattended risk boundary: prefer bounded and reversible work. Do not introduce a new destructive surface merely to stay active. Before delete-sync, recursive cleanup, history/worktree replacement, generated-artifact removal, external UI/account control, deployment, or publication, require explicit prior authorization or a clearly established project workflow; use a read-only dry run first and verify a trustworthy recovery source. When the main objective is already complete, accept only lower-risk follow-up candidates.`,
     `Before ending, reconcile the todo list with this report: complete achieved items, mark externally waiting items blocked with the unblock condition in their content, add material candidates, and close stale candidates explicitly. Then include this exact block:`,
     `CYCLE_PROGRESS`,
     `kind: <validated|committed|diagnosed|todo|none>`,
     `goal: <the responsibility-scope objective advanced this round>`,
     `evidence: <the new validation, commit, diagnostic fact, todo transition, or why none>`,
-    `Use validated only for a newly successful relevant check, committed only for a durable VCS mutation, diagnosed only for new tool-backed evidence that materially changes the problem state, todo only for a real work-item state transition, and none when the round produced activity but no durable evidence. File edits alone are activity, not progress.`,
+    `Choose the kind that best describes the strongest evidence: validated for a newly successful relevant check, committed for a durable VCS mutation, diagnosed for new tool-backed evidence that materially changes the problem state, todo for a real work-item state transition, and none when the round produced activity but no durable evidence. The engine considers all observed evidence instead of discarding a round merely because another valid kind would also fit. File edits alone are activity, not progress.`,
   )
   lines.push(
     `If you already completed iteration ${round} or later, treat this as a duplicate delivery: confirm briefly without redoing work.`,

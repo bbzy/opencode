@@ -44,9 +44,11 @@ describe("session cycle scheduling", () => {
     expect(Loop.scheduleMode()).toBe("cycle")
   })
 
-  test("cycle rounds request a soft checkpoint at the provider-turn budget", () => {
+  test("cycle rounds checkpoint at the provider-turn budget and force the grace turn to yield", () => {
     expect(Loop.roundNeedsCheckpoint(Loop.loopConfig.maxRoundProviderTurns - 1)).toBe(false)
     expect(Loop.roundNeedsCheckpoint(Loop.loopConfig.maxRoundProviderTurns)).toBe(true)
+    expect(Loop.roundMustYield(Loop.loopConfig.maxRoundProviderTurns)).toBe(false)
+    expect(Loop.roundMustYield(Loop.loopConfig.maxRoundProviderTurns + 1)).toBe(true)
   })
 
   test("cycle round prompts omit the misleading Next clock time", () => {
@@ -119,6 +121,33 @@ reason: The state is recoverable but noisy.
     expect(Loop.chaosAssessment("CYCLE_CHAOS\nstate_clarity: 5")).toBeUndefined()
   })
 
+  test("chaosAssessment applies engine-observed floors to optimistic self-assessments", () => {
+    const result = Loop.chaosAssessment(
+      `CYCLE_CHAOS
+state_clarity: 1
+history_noise: 1
+conflict_drift: 1
+execution_continuity: 1
+context_pressure: 1
+reason: Everything recovered.`,
+      {
+        providerTurns: 110,
+        toolCalls: 104,
+        toolErrors: 2,
+        durationMs: 70 * 60 * 1000,
+        contextUsage: 0.55,
+        destructiveOperations: 1,
+      },
+    )
+    expect(result).toMatchObject({
+      stateClarity: 2,
+      historyNoise: 2,
+      executionContinuity: 3,
+      contextPressure: 2,
+    })
+    expect(result!.score).toBeGreaterThan(40)
+  })
+
   test("cycle round prompts list unfinished todos and gate the DONE exit", () => {
     const prompt = Loop.buildCyclePrompt(2, {
       consecutiveDry: 0,
@@ -143,8 +172,17 @@ reason: The state is recoverable but noisy.
     expect(prompt).toContain('Unfinished todos (1): "Implement the fix"')
     expect(prompt).toContain('Blocked tasks (1): "Device acceptance')
     expect(prompt).toContain("entire scope has no worthwhile independently actionable work")
+    expect(prompt).toContain("hard boundaries until conditions actually change")
+    expect(prompt).toContain("Unattended risk boundary")
     expect(prompt).toContain("CYCLE_PROGRESS")
     expect(prompt).toContain("File edits alone are activity, not progress")
+  })
+
+  test("cycle outcome confirmation preserves authorization and safety boundaries", () => {
+    const prompt = Loop.buildCyclePrompt(9, { consecutiveDry: 1, consecutiveExhausted: 1 })
+    expect(prompt).toContain("low-cost, read-only review")
+    expect(prompt).toContain("Do not weaken a previously established blocker")
+    expect(prompt).toContain("external UI/account actions")
   })
 
   test("roundMadeProgress requires durable evidence instead of counting file activity", () => {
@@ -159,9 +197,36 @@ reason: The state is recoverable but noisy.
     ).toBe(true)
     expect(
       Loop.roundMadeProgress(
+        round(toolPart({ tool: "bash", status: "completed", command: "jj desc --no-pager -m fix" })),
+        "m1",
+        "CYCLE_PROGRESS\nkind: committed\ngoal: describe the revision\nevidence: jj desc completed",
+      ),
+    ).toBe(true)
+    expect(
+      Loop.roundMadeProgress(
         round(toolPart({ tool: "bash", status: "completed", command: "git commit -m x" })),
         "m1",
         "CYCLE_PROGRESS\nkind: committed\ngoal: land the fix\nevidence: git commit completed",
+      ),
+    ).toBe(true)
+    expect(
+      Loop.roundMadeProgress(
+        round(
+          toolPart({
+            tool: "bash",
+            status: "completed",
+            command: "LD_PRELOAD= ./gradlew :WeChatLiveDemo:assembleDebug --console=plain",
+          }),
+        ),
+        "m1",
+        "CYCLE_PROGRESS\nkind: validated\ngoal: verify Android\nevidence: assembleDebug passed",
+      ),
+    ).toBe(true)
+    expect(
+      Loop.roundMadeProgress(
+        round(toolPart({ tool: "bash", status: "completed", command: "git commit -m fix" })),
+        "m1",
+        "CYCLE_PROGRESS\nkind: validated\ngoal: land the fix\nevidence: commit is the strongest durable evidence",
       ),
     ).toBe(true)
     expect(
@@ -273,7 +338,7 @@ reason: The state is recoverable but noisy.
     const blocked = "Waiting\nCYCLE_OUTCOME: blocked"
     expect(Loop.eligibleRoundOutcome(exhausted, [])).toBe("exhausted")
     expect(Loop.eligibleRoundOutcome(blocked, [{ status: "blocked" }])).toBe("blocked")
-    expect(Loop.eligibleRoundOutcome(exhausted, [{ status: "blocked" }])).toBeUndefined()
+    expect(Loop.eligibleRoundOutcome(exhausted, [{ status: "blocked" }])).toBe("exhausted")
     expect(Loop.eligibleRoundOutcome(blocked, [{ status: "pending" }])).toBeUndefined()
   })
 
