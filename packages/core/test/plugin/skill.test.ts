@@ -23,7 +23,7 @@ describe("SkillPlugin.Plugin", () => {
     }),
   )
 
-  it.effect("registers the built-in cycle-on-project skill bound to /cycle", () =>
+  it.effect("registers the built-in Cycle owner and reflection skills", () =>
     Effect.gen(function* () {
       const skill = yield* SkillV2.Service
       yield* SkillPlugin.Plugin.effect(host({ skill: { ...skill, reload: skill.reload } }))
@@ -37,6 +37,17 @@ describe("SkillPlugin.Plugin", () => {
       const entry = (yield* skill.list()).find((item) => item.name === "cycle-on-project")
       expect(entry?.content).toContain("[Cycle #N]")
       expect(entry?.description).toContain("[Cycle #N]")
+      expect(entry?.content).not.toContain("Phase 1")
+
+      expect(yield* skill.list()).toContainEqual(
+        expect.objectContaining({
+          name: "cycle-reflect",
+          description: expect.stringContaining("three consecutive rounds without tool activity"),
+        }),
+      )
+      const reflect = (yield* skill.list()).find((item) => item.name === "cycle-reflect")
+      expect(reflect?.content).toContain("temporary reassessment")
+      expect(reflect?.content).not.toContain("Phase 4")
     }),
   )
 })
