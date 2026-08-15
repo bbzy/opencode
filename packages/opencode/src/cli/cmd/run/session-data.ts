@@ -25,7 +25,6 @@
 //   event arrives, the queue entry is removed and the footer falls back
 //   to the next pending request or to the prompt view.
 import type { Event, LoopState2, Part, PermissionRequest, QuestionRequest, ToolPart } from "@opencode-ai/sdk/v2"
-import { loopConfig } from "@/session/loop"
 import * as Locale from "@/util/locale"
 import { toolView } from "./tool"
 import type { FooterOutput, FooterPatch, FooterView, StreamCommit } from "./types"
@@ -194,15 +193,10 @@ function msgErr(id: string): string {
 function formatLoopState(state: LoopState2): string {
   const round = state.rounds > 0 ? `#${state.rounds}` : ""
   const consecutiveDry = state.consecutiveDry ?? 0
-  const phase =
-    consecutiveDry > loopConfig.maxDryIterations
-      ? "plan"
-      : consecutiveDry === loopConfig.maxDryIterations
-        ? "reflect"
-        : `${consecutiveDry}/${loopConfig.maxDryIterations} no-progress`
-  const dry = consecutiveDry > 0 ? ` ${phase}` : ""
+  const activity = `${consecutiveDry} tool-free`
+  const dry = consecutiveDry > 0 ? ` ${activity}` : ""
   if (state.paused) {
-    const reason = consecutiveDry > 0 ? `paused, ${phase}` : "paused"
+    const reason = consecutiveDry > 0 ? `paused, ${activity}` : "paused"
     return `CYCLE ${round}(${reason})`.trim()
   }
   if (state.running) return `CYCLE ${round}(running${dry})`.trim()
