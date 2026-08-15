@@ -936,6 +936,80 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
+    "cycle strategy summarizes all visible history with no retained tail or default continuation",
+    () => {
+      const stub = llm()
+      let captured = ""
+      stub.push(reply("current handoff", (input) => (captured = JSON.stringify(input.messages))))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "old project history")
+        yield* createUserMessage(session.id, "currently fixing cycle compaction")
+        yield* createSummaryCompaction(session.id)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const parent = msgs.at(-1)?.info.id
+        expect(parent).toBeTruthy()
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: parent!,
+          messages: msgs,
+          sessionID: session.id,
+          auto: true,
+          strategy: "cycle",
+        })
+
+        const all = yield* ssn.messages({ sessionID: session.id })
+        const part = yield* readCompactionPart(session.id)
+        expect(result).toBe("continue")
+        expect(part?.tail_start_id).toBeUndefined()
+        expect(all.at(-1)?.info.role).toBe("assistant")
+        expect(captured).toContain("Output only the handoff for the work currently in hand")
+        expect(captured).toContain("currently fixing cycle compaction")
+        expect(captured).not.toContain("## Objective")
+        expect(
+          all.some(
+            (message) =>
+              message.info.role === "user" &&
+              message.parts.some(
+                (part) => part.type === "text" && part.text.includes("Continue if you have next steps"),
+              ),
+          ),
+        ).toBe(false)
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+  )
+
+  it.instance(
+    "cycle strategy uses its supplied continuation after mid-round compaction",
+    Effect.gen(function* () {
+      const ssn = yield* SessionNs.Service
+      const session = yield* ssn.create({})
+      const msg = yield* createUserMessage(session.id, "hello")
+      const msgs = yield* ssn.messages({ sessionID: session.id })
+
+      const result = yield* SessionCompaction.use.process({
+        parentID: msg.id,
+        messages: msgs,
+        sessionID: session.id,
+        auto: true,
+        strategy: "cycle",
+        continuation: "Reload cycle-on-project and continue with the preserved todo snapshot.",
+      })
+
+      const last = (yield* ssn.messages({ sessionID: session.id })).at(-1)
+      expect(result).toBe("continue")
+      expect(last?.info.role).toBe("user")
+      expect(last?.parts[0]).toMatchObject({
+        type: "text",
+        synthetic: true,
+        metadata: { compaction_continue: true },
+        text: "Reload cycle-on-project and continue with the preserved todo snapshot.",
+      })
+    }),
+  )
+
+  itCompaction.instance(
     "persists tail_start_id for retained recent turns",
     Effect.gen(function* () {
       const ssn = yield* SessionNs.Service
