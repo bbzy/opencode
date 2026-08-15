@@ -17,6 +17,7 @@ import { SessionProcessor } from "../../src/session/processor"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
+import { Question } from "../../src/question"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -173,6 +174,7 @@ const root = LayerNode.group([
   Database.node,
   EventV2Bridge.node,
   SessionStatus.node,
+  Question.node,
   CrossSpawnSpawner.node,
 ])
 const replacements = [
@@ -1198,6 +1200,21 @@ const toolInFlightLLM = Layer.succeed(
 const toolInFlightEnv = LayerNode.compile(root, [...replacements, [LLM.node, toolInFlightLLM]])
 const itToolInFlight = testEffect(toolInFlightEnv)
 
+const questionInFlightLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-1", name: "question" }),
+        LLMEvent.toolInputEnd({ id: "call-1", name: "question" }),
+        LLMEvent.toolCall({ id: "call-1", name: "question", input: { questions: [] }, providerExecuted: true }),
+      ).pipe(Stream.concat(Stream.never)),
+  }),
+)
+const questionInFlightEnv = LayerNode.compile(root, [...replacements, [LLM.node, questionInFlightLLM]])
+const itQuestionInFlight = testEffect(questionInFlightEnv)
+
 // One identical grep call per provider turn: the per-step doom-loop
 // permission check (3 identical calls in a single message) never fires, so
 // only the cross-step circuit breaker can stop this pattern.
@@ -1324,6 +1341,62 @@ itToolInFlight.live("session.processor stops an unattended tool that exceeds its
           const value = yield* handle.process(stallInput(parent, chat.id, mdl))
           expect(value).toBe("stop")
           expect(JSON.stringify(handle.message.error)).toContain("Unattended tool exceeded")
+        } finally {
+          SessionProcessor.processorConfig.unattendedToolTimeoutMs = originalTimeout
+          SessionProcessor.processorConfig.stallCheckMs = originalCheck
+        }
+      }),
+    { config: cfg },
+  ),
+)
+
+itQuestionInFlight.live("session.processor lets an unattended question wait for the user without a timeout", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const originalTimeout = SessionProcessor.processorConfig.unattendedToolTimeoutMs
+        const originalCheck = SessionProcessor.processorConfig.stallCheckMs
+        SessionProcessor.processorConfig.unattendedToolTimeoutMs = 200
+        SessionProcessor.processorConfig.stallCheckMs = 50
+        try {
+          const { processors, session, provider } = yield* boot()
+          const question = yield* Question.Service
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "hi")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+            unattended: true,
+          })
+
+          const run = yield* handle.process(stallInput(parent, chat.id, mdl)).pipe(Effect.forkChild)
+          const answer = yield* question
+            .ask({
+              sessionID: chat.id,
+              questions: [
+                {
+                  header: "Direction",
+                  question: "What should happen next?",
+                  options: [{ label: "Continue", description: "Continue the current work" }],
+                },
+              ],
+              tool: { messageID: msg.id, callID: "call-1" },
+            })
+            .pipe(Effect.forkChild)
+          const request = yield* waitFor(
+            question.list().pipe(Effect.map((requests) => requests[0])),
+            "question never became pending",
+          )
+
+          yield* Effect.sleep("500 millis")
+          expect(handle.message.error).toBeUndefined()
+
+          yield* question.reply({ requestID: request.id, answers: [["Continue"]] })
+          expect(yield* Fiber.join(answer)).toEqual([["Continue"]])
+          yield* Fiber.interrupt(run)
         } finally {
           SessionProcessor.processorConfig.unattendedToolTimeoutMs = originalTimeout
           SessionProcessor.processorConfig.stallCheckMs = originalCheck
