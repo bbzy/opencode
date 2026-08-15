@@ -34,9 +34,11 @@ export const processorConfig = {
   // flight) is treated as hung: the turn fails instead of waiting forever.
   stallTimeoutMs: 10 * 60 * 1000,
   stallCheckMs: 30 * 1000,
-  // An unattended tool can keep the stream alive forever while holding the
-  // whole Session drain. Individual tools should still enforce tighter
-  // limits; this is the process-level backstop for every tool implementation.
+  // A non-interactive unattended tool can keep the stream alive forever while
+  // holding the whole Session drain. Individual tools should still enforce
+  // tighter limits; this is the process-level backstop. Tools with a pending
+  // Question request are interactive waits and remain pending until the user
+  // replies, rejects, or interrupts them.
   unattendedToolTimeoutMs: 20 * 60 * 1000,
   // Identical tool call (same tool + same input) this many times in a row,
   // across steps, hard-stops the turn. The interactive doom-loop permission
@@ -120,6 +122,7 @@ const layer = Layer.effect(
     const agents = yield* Agent.Service
     const llm = yield* LLM.Service
     const permission = yield* Permission.Service
+    const question = yield* Question.Service
     const plugin = yield* Plugin.Service
     const summary = yield* SessionSummary.Service
     const scope = yield* Scope.Scope
@@ -718,13 +721,21 @@ const layer = Layer.effect(
               while (true) {
                 yield* Effect.sleep(Duration.millis(processorConfig.stallCheckMs))
                 const tools = Object.values(ctx.toolcalls)
-                const expired =
-                  ctx.unattended &&
-                  tools.find(
-                    (tool) =>
-                      tool.startedAt !== undefined &&
-                      Date.now() - tool.startedAt > processorConfig.unattendedToolTimeoutMs,
-                  )
+                const timedOut = ctx.unattended
+                  ? Object.entries(ctx.toolcalls).filter(
+                      ([, tool]) =>
+                        tool.startedAt !== undefined &&
+                        Date.now() - tool.startedAt > processorConfig.unattendedToolTimeoutMs,
+                    )
+                  : []
+                const waiting = new Set(
+                  timedOut.length === 0
+                    ? []
+                    : (yield* question.list())
+                        .filter((request) => request.sessionID === ctx.sessionID)
+                        .flatMap((request) => (request.tool ? [request.tool.callID] : [])),
+                )
+                const expired = timedOut.find(([toolCallID]) => !waiting.has(toolCallID))
                 if (expired)
                   return yield* Effect.fail(
                     new Error(
@@ -811,6 +822,7 @@ export const node = LayerNode.make({
     Agent.node,
     LLM.node,
     Permission.node,
+    Question.node,
     Plugin.node,
     SessionSummary.node,
     SessionStatus.node,
