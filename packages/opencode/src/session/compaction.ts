@@ -174,6 +174,8 @@ export interface Interface {
     sessionID: SessionID
     auto: boolean
     overflow?: boolean
+    strategy?: "cycle"
+    continuation?: string
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
     sessionID: SessionID
@@ -322,6 +324,8 @@ const layer = Layer.effect(
       sessionID: SessionID
       auto: boolean
       overflow?: boolean
+      strategy?: "cycle"
+      continuation?: string
     }) {
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
@@ -364,16 +368,33 @@ const layer = Layer.effect(
       const prior = completedCompactions(history)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
       const previousSummary = prior.at(-1)?.summary
-      const selected = yield* select({
-        messages: history.filter((_, index) => !hidden.has(index)),
-        cfg,
-        model,
-      })
+      const visible = history.filter((_, index) => !hidden.has(index))
+      const selected =
+        input.strategy === "cycle"
+          ? { head: visible, tail_start_id: undefined }
+          : yield* select({
+              messages: visible,
+              cfg,
+              model,
+            })
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
         "experimental.session.compacting",
         { sessionID: input.sessionID },
-        { context: [], prompt: undefined },
+        {
+          context: [],
+          prompt:
+            input.strategy === "cycle"
+              ? [
+                  "The session is too long and needs a handoff. Output only the handoff for the work currently in hand: what is being developed or what problem is being fixed, where that work stands, and what should happen next. Do not summarize other long-term work; that work belongs in the session todo list.",
+                  previousSummary
+                    ? `The handoff below came from the previous compaction. Update or replace it using the newer conversation, and do not accumulate work that is resolved or no longer current.\n\n<previous-handoff>\n${previousSummary}\n</previous-handoff>`
+                    : "",
+                ]
+                  .filter(Boolean)
+                  .join("\n\n")
+              : undefined,
+        },
       )
       const msgs = structuredClone(selected.head)
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
@@ -492,30 +513,42 @@ const layer = Layer.effect(
               sessionID: input.sessionID,
             })
           }
+          if (input.continuation) {
+            yield* session.updatePart({
+              id: PartID.ascending(),
+              messageID: replayMsg.id,
+              sessionID: input.sessionID,
+              type: "text",
+              synthetic: true,
+              metadata: { compaction_continue: true },
+              text: input.continuation,
+            })
+          }
         }
 
-        if (!replay) {
+        if (!replay && (input.strategy !== "cycle" || input.continuation)) {
           const info = yield* provider.getProvider(userMessage.model.providerID)
-          if (
-            (yield* plugin.trigger(
-              "experimental.compaction.autocontinue",
-              {
-                sessionID: input.sessionID,
-                agent: userMessage.agent,
-                model: yield* provider
-                  .getModel(userMessage.model.providerID, userMessage.model.modelID)
-                  .pipe(Effect.orDie),
-                provider: {
-                  source: info.source,
-                  info,
-                  options: info.options,
+          const enabled = input.continuation
+            ? true
+            : (yield* plugin.trigger(
+                "experimental.compaction.autocontinue",
+                {
+                  sessionID: input.sessionID,
+                  agent: userMessage.agent,
+                  model: yield* provider
+                    .getModel(userMessage.model.providerID, userMessage.model.modelID)
+                    .pipe(Effect.orDie),
+                  provider: {
+                    source: info.source,
+                    info,
+                    options: info.options,
+                  },
+                  message: userMessage,
+                  overflow: input.overflow === true,
                 },
-                message: userMessage,
-                overflow: input.overflow === true,
-              },
-              { enabled: true },
-            )).enabled
-          ) {
+                { enabled: true },
+              )).enabled
+          if (enabled) {
             const continueMsg = yield* session.updateMessage({
               id: MessageID.ascending(),
               role: "user",
@@ -525,10 +558,11 @@ const layer = Layer.effect(
               model: userMessage.model,
             })
             const text =
+              input.continuation ??
               (input.overflow
                 ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
                 : "") +
-              "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+                "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
             yield* session.updatePart({
               id: PartID.ascending(),
               messageID: continueMsg.id,
