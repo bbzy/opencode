@@ -64,6 +64,25 @@ const withHome = <A, E, R>(home: string, self: Effect.Effect<A, E, R>) =>
   )
 
 describe("skill", () => {
+  it.live("registers the built-in Cycle owner and reflection skills", () =>
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const builtins = (yield* (yield* Skill.Service).all()).filter((skill) => skill.location === "<built-in>")
+          expect(builtins).toContainEqual(
+            expect.objectContaining({ name: "cycle-on-project", description: expect.stringContaining("/cycle") }),
+          )
+          expect(builtins).toContainEqual(
+            expect.objectContaining({
+              name: "cycle-reflect",
+              description: expect.stringContaining("three consecutive rounds without tool activity"),
+            }),
+          )
+        }),
+      { git: true },
+    ),
+  )
+
   it.effect("formats verbose locations as XML-safe filesystem paths", () =>
     Effect.sync(() => {
       const output = Skill.fmt(
