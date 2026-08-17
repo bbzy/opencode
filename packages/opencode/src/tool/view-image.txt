@@ -1,7 +1,7 @@
 Analyze an image file with a vision model. Use this when the current model cannot see images (for example a text-only model) but you need to understand a screenshot, diagram, chart, or other image on disk.
 
-The image is sent to the first vision model from the image_models config that resolves to a connected provider, called directly through its provider API. No other system prompt is injected — the vision model only receives the image and your question.
+The image is sent directly through a connected provider API. Configured models are tried in preference order, with automatic fallback when inference fails. No other system prompt is injected — the vision model only receives the image and your question.
 
-image_models entries are provider/model pairs (e.g. deepseek/gpt-4o) so the model is pinned precisely; the model part may contain slashes (e.g. astra/minimax_m3_code/infer). Entries are tried in order — the first that exists on a connected provider is used.
+image_models entries are provider/model pairs (e.g. deepseek/gpt-4o) so each model is pinned precisely; the model part may contain slashes (e.g. astra/minimax_m3_code/infer). A model is skipped after two consecutive inference failures, and view_image fails fast when every configured model is disabled. Changing image_models or restarting opencode resets this process-local circuit.
 
 Provide the absolute path to the image in filePath. Optionally pass a specific question in prompt; when omitted, the vision model returns a detailed description of the image. The vision model's answer is returned to you as text.
