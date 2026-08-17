@@ -662,7 +662,7 @@ export type Todo = {
    */
   content: string
   /**
-   * Current status of the task: pending, in_progress, completed, cancelled
+   * Current status of the task. blocked means the item cannot advance until the unblock condition recorded in content becomes true; it does not imply the whole responsibility scope is blocked.
    */
   status: string
   /**
@@ -694,9 +694,13 @@ export type SessionStatus =
     }
 
 export type LoopState = {
-  mode?: "loop" | "cycle"
+  mode?: "cycle"
   intervalStr: string
+  model?: string
   rounds: number
+  successfulRounds?: number
+  failedRounds?: number
+  interruptedRounds?: number
   startedAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   nextRunAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   paused: boolean
@@ -706,6 +710,8 @@ export type LoopState = {
   consecutiveDry?: number
   coalescedCount: number
   lastStatus?: "success" | "fail"
+  lastError?: string
+  pauseReason?: string
 }
 
 export type QuestionOption = {
@@ -2844,9 +2850,13 @@ export type SessionStatus2 = {
 }
 
 export type LoopState1 = {
-  mode?: "loop" | "cycle"
+  mode?: "cycle"
   intervalStr: string
+  model?: string
   rounds: number
+  successfulRounds?: number
+  failedRounds?: number
+  interruptedRounds?: number
   startedAt: number | "NaN" | "Infinity" | "-Infinity"
   nextRunAt: number | "NaN" | "Infinity" | "-Infinity"
   paused: boolean
@@ -2856,6 +2866,8 @@ export type LoopState1 = {
   consecutiveDry?: number
   coalescedCount: number
   lastStatus?: "success" | "fail"
+  lastError?: string
+  pauseReason?: string
 }
 
 export type QuestionReplied2 = {
@@ -3061,9 +3073,13 @@ export type EventTuiSessionSelect2 = {
 }
 
 export type LoopState2 = {
-  mode?: "loop" | "cycle"
+  mode?: "cycle"
   intervalStr: string
+  model?: string
   rounds: number
+  successfulRounds?: number
+  failedRounds?: number
+  interruptedRounds?: number
   startedAt: number | "NaN" | "Infinity" | "-Infinity"
   nextRunAt: number | "NaN" | "Infinity" | "-Infinity"
   paused: boolean
@@ -3073,6 +3089,8 @@ export type LoopState2 = {
   consecutiveDry?: number
   coalescedCount: number
   lastStatus?: "success" | "fail"
+  lastError?: string
+  pauseReason?: string
 }
 
 export type CredentialValue = CredentialOAuth | CredentialKey

@@ -1,15 +1,18 @@
 import { Effect, Fiber, Schema } from "effect"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { SkillPlugin } from "@opencode-ai/core/plugin/skill"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 
 export const loopConfig = {
   minIntervalMs: 30_000,
   maxConsecutiveFailures: 5,
   // Consecutive tool-free rounds before the scheduler challenges the agent
-  // with the separate reflection skill.
-  maxDryIterations: 3,
+  // with the separately maintained reflection contract.
+  maxDryIterations: 2,
   // Tool-free rounds after the reflection round before pausing. The
   // reflection round itself is excluded from both inactivity sequences.
-  maxPostReflectionDryIterations: 3,
+  maxPostReflectionDryIterations: 1,
   // Catch cross-round text loops.
   maxConsecutiveDuplicateResponses: 3,
   // Provider returned nothing (no parts, zero output tokens) this many times
@@ -57,7 +60,14 @@ export type ScheduleInfo = Schema.Schema.Type<typeof ScheduleInfo>
 export type LoopState = {
   intervalStr: string
   schedule: ScheduleInfo
+  model: {
+    providerID: ProviderV2.ID
+    modelID: ModelV2.ID
+  }
   rounds: number
+  successfulRounds: number
+  failedRounds: number
+  interruptedRounds: number
   startedAt: number
   nextRunAt: number
   paused: boolean
@@ -70,6 +80,8 @@ export type LoopState = {
   consecutiveEmpty: number
   coalescedCount: number
   lastStatus?: "success" | "fail"
+  lastError?: string
+  pauseReason?: string
   timezone: string
   lastResponseFingerprint?: string
   fiber: Fiber.Fiber<void, unknown>
@@ -99,9 +111,7 @@ export function scheduleMode(): "cycle" {
   return "cycle"
 }
 
-export function buildPostCompactionContext(
-  todos: readonly { content: string; status: string; priority: string }[],
-) {
+export function buildPostCompactionContext(todos: readonly { content: string; status: string; priority: string }[]) {
   return [
     "The session context was compacted. Before continuing, load the cycle-on-project skill.",
     "The Cycle engine preserved this complete session todo snapshot:",
@@ -139,7 +149,11 @@ export function buildCyclePrompt(
   }
   if (context && context.consecutiveDry >= loopConfig.maxDryIterations) {
     lines.push(
-      `Reflection trigger: use the cycle-reflect skill now, loading it only if its body is not already visible in this session. This reflection round is excluded from tool-activity counting. After it ends, the Cycle will observe a fresh sequence of rounds; any tool call returns to normal operation, while ${loopConfig.maxPostReflectionDryIterations} consecutive tool-free rounds will pause the Cycle.`,
+      `Reflection trigger: apply the cycle-reflect contract injected below now. Do not load cycle-reflect with the skill tool; the complete contract is already present in this prompt.`,
+      "<cycle-reflect>",
+      SkillPlugin.CycleReflectContent,
+      "</cycle-reflect>",
+      `This reflection round is excluded from tool-activity counting. After it ends, the Cycle will observe a fresh sequence of rounds; any tool call returns to normal operation, while ${loopConfig.maxPostReflectionDryIterations} consecutive tool-free rounds will pause the Cycle.`,
     )
   }
   return lines.join("\n")
