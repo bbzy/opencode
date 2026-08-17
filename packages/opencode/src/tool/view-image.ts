@@ -32,13 +32,22 @@ export const ViewImageTool = Tool.define<
     const fs = yield* FSUtil.Service
     const provider = yield* Provider.Service
     const config = yield* Config.Service
+    const circuit = {
+      signature: "",
+      failures: new Map<string, { count: number; message: string }>(),
+    }
+    const failureLimit = 2
 
-    const resolveModel = Effect.fn("ViewImage.resolveModel")(function* (names: string[]) {
+    const resolveModels = Effect.fn("ViewImage.resolveModels")(function* (names: string[]) {
       const providers = yield* provider.list()
-      for (const name of names) {
-        const model = yield* matchModel(providers, name)
-        if (model) return model
-      }
+      const models = (yield* Effect.forEach(names, (name) => matchModel(providers, name)))
+        .filter((model): model is Provider.Model => model !== undefined)
+        .filter(
+          (model, index, all) =>
+            all.findIndex((candidate) => candidate.providerID === model.providerID && candidate.id === model.id) ===
+            index,
+        )
+      if (models.length > 0) return models
       const available = Object.values(providers)
         .flatMap((info) => Object.keys(info.models))
         .slice(0, 20)
@@ -53,8 +62,8 @@ export const ViewImageTool = Tool.define<
 
     // image_models entries are "provider/model" pairs so the model is pinned
     // precisely; the model part may itself contain slashes (e.g.
-    // "astra/minimax_m3_code/infer"). Entries are tried in order and the first
-    // one that exists on a connected provider wins.
+    // "astra/minimax_m3_code/infer"). Resolved entries remain ordered so a
+    // healthy preferred model wins while failed models can fall back.
     const matchModel = Effect.fn("ViewImage.matchModel")(function* (
       providers: Record<Provider.Info["id"], Provider.Info>,
       name: string,
@@ -106,11 +115,39 @@ export const ViewImageTool = Tool.define<
       const names = cfg.image_models ?? []
       if (names.length === 0) {
         return yield* Effect.fail(
-          new Error(`image_models is not configured. Add vision model names (e.g. "gpt-4o") to the image_models config.`),
+          new Error(
+            `image_models is not configured. Add vision model names (e.g. "gpt-4o") to the image_models config.`,
+          ),
         )
       }
-      const model = yield* resolveModel(names)
-      const language = yield* provider.getLanguage(model)
+      const signature = JSON.stringify(names)
+      if (circuit.signature !== signature) {
+        circuit.signature = signature
+        circuit.failures.clear()
+      }
+      const models = yield* resolveModels(names)
+      const key = (model: Provider.Model) => `${model.providerID}/${model.id}`
+      const candidates = models
+        .filter((model) => (circuit.failures.get(key(model))?.count ?? 0) < failureLimit)
+        .toSorted(
+          (first, second) =>
+            (circuit.failures.get(key(first))?.count ?? 0) - (circuit.failures.get(key(second))?.count ?? 0),
+        )
+      const first = candidates[0]
+      if (!first) {
+        return yield* Effect.fail(
+          new Error(
+            `All configured image_models are disabled after ${failureLimit} consecutive failures. ` +
+              models
+                .map((model) => {
+                  const failure = circuit.failures.get(key(model))
+                  return `${key(model)}: ${failure?.message ?? "unavailable"}`
+                })
+                .join("; ") +
+              ". Change image_models or restart opencode before retrying view_image.",
+          ),
+        )
+      }
 
       const messages: ModelMessage[] = [
         {
@@ -121,16 +158,33 @@ export const ViewImageTool = Tool.define<
           ],
         },
       ]
-      const result = yield* Effect.tryPromise(() =>
-        generateText({ model: language, messages, abortSignal: ctx.abort }),
-      ).pipe(
-        Effect.mapError((error) => new Error(`Vision model ${model.providerID}/${model.id} failed: ${String(error)}`)),
-      )
+      const attempt = (model: Provider.Model) =>
+        Effect.suspend(() =>
+          ctx.abort.aborted
+            ? Effect.interrupt
+            : provider.getLanguage(model).pipe(
+                Effect.flatMap((language) =>
+                  Effect.tryPromise(() => generateText({ model: language, messages, abortSignal: ctx.abort })),
+                ),
+                Effect.mapError((error) => new Error(`Vision model ${key(model)} failed: ${String(error)}`)),
+                Effect.tapError((error) =>
+                  ctx.abort.aborted
+                    ? Effect.void
+                    : Effect.sync(() => {
+                        const previous = circuit.failures.get(key(model))
+                        circuit.failures.set(key(model), { count: (previous?.count ?? 0) + 1, message: error.message })
+                      }),
+                ),
+                Effect.tap(() => Effect.sync(() => circuit.failures.delete(key(model)))),
+                Effect.map((result) => ({ model, result })),
+              ),
+        )
+      const inference = yield* Effect.firstSuccessOf([attempt(first), ...candidates.slice(1).map(attempt)])
 
       return {
         title,
-        output: result.text,
-        metadata: { model: `${model.providerID}/${model.id}`, filePath: filepath },
+        output: inference.result.text,
+        metadata: { model: key(inference.model), filePath: filepath },
       }
     })
 
