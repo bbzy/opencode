@@ -206,7 +206,7 @@ const layer = Layer.effect(
           }
         }
 
-        yield* config.get()
+        const cfg = yield* config.get()
         const questionEnabled = ["app", "cli", "desktop"].includes(flags.client) || flags.enableQuestionTool
 
         const tool = yield* Effect.all({
@@ -237,7 +237,7 @@ const layer = Layer.effect(
             ...(questionEnabled ? [tool.question] : []),
             tool.shell,
             tool.read,
-            tool.viewImage,
+            ...(cfg.image_models?.length ? [tool.viewImage] : []),
             tool.glob,
             tool.grep,
             tool.edit,
