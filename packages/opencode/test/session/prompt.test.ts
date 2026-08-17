@@ -2680,6 +2680,40 @@ it.instance("retries when finish=stop but response has reasoning with no text or
   }),
 )
 
+it.instance(
+  "raw DSML tool-call markup is retried through the normal provider protocol",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, sessions, chat } = yield* boot({ title: "Malformed tool protocol" })
+      yield* llm.text(
+        '<｜DSML｜tool_calls><｜DSML｜invoke name="bash"><｜DSML｜parameter name="command">true</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>',
+      )
+      yield* llm.text("recovered response")
+
+      const result = yield* prompt.prompt({
+        sessionID: chat.id,
+        model: ref,
+        parts: [{ type: "text", text: "inspect the repository" }],
+      })
+
+      const text = result.parts.find((part) => part.type === "text")
+      expect(text?.type === "text" && text.text).toBe("recovered response")
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      expect(
+        messages.some(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some(
+              (part) => part.type === "text" && part.synthetic && part.text.includes("raw DSML tool-call markup"),
+            ),
+        ),
+      ).toBe(true)
+    }),
+  { config: cfg },
+  30_000,
+)
+
 // /cycle command
 
 noLLMServer.instance(
@@ -3255,6 +3289,72 @@ it.instance(
 )
 
 it.instance(
+  "/cycle records a stalled round and schedules the next idle-anchored attempt",
+  () =>
+    Effect.gen(function* () {
+      const originalMin = loopConfig.minIntervalMs
+      const originalTimeout = SessionProcessor.processorConfig.stallTimeoutMs
+      const originalCheck = SessionProcessor.processorConfig.stallCheckMs
+      loopConfig.minIntervalMs = 50
+      SessionProcessor.processorConfig.stallTimeoutMs = 200
+      SessionProcessor.processorConfig.stallCheckMs = 50
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, sessions, chat } = yield* boot({ title: "Cycle stall recovery" })
+        yield* llm.hang
+        yield* llm.text("recovered after stall")
+
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 300ms" })
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const state = (yield* prompt.loopState())[chat.id]
+            const messages = yield* sessions.messages({ sessionID: chat.id })
+            const notified = messages.some(
+              (message) =>
+                message.info.role === "user" &&
+                message.parts.some(
+                  (part) => part.type === "text" && part.text.includes("Iteration failed: LLM stream stalled"),
+                ),
+            )
+            return state?.failedRounds === 1 && !state.running && notified ? (true as const) : undefined
+          }),
+          "cycle did not record the stalled round",
+          "10 seconds",
+        )
+
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const state = (yield* prompt.loopState())[chat.id]
+            return state?.rounds >= 2 && state.successfulRounds >= 1 ? (true as const) : undefined
+          }),
+          "cycle did not schedule a recovery round after the stall",
+          "10 seconds",
+        )
+
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        const stalled = messages.find(
+          (message) =>
+            message.info.role === "assistant" && JSON.stringify(message.info.error).includes("LLM stream stalled"),
+        )
+        expect(stalled?.info.role).toBe("assistant")
+        if (stalled?.info.role === "assistant") expect(stalled.info.finish).toBe("error")
+
+        const status = yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "status" })
+        const statusText = status.parts.find((part) => part.type === "text")
+        expect(statusText?.type === "text" && statusText.text).toContain("rounds attempted")
+        expect(statusText?.type === "text" && statusText.text).toContain("model test/test-model")
+        yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
+      } finally {
+        loopConfig.minIntervalMs = originalMin
+        SessionProcessor.processorConfig.stallTimeoutMs = originalTimeout
+        SessionProcessor.processorConfig.stallCheckMs = originalCheck
+      }
+    }),
+  { config: cfg },
+  30_000,
+)
+
+it.instance(
   "/cycle excludes the reflection round from both inactivity sequences",
   () =>
     Effect.gen(function* () {
@@ -3271,7 +3371,6 @@ it.instance(
         const { prompt, chat } = yield* boot()
         yield* llm.text("first idle round")
         yield* llm.text("second idle round")
-        yield* llm.tool("skill", { name: "cycle-reflect" })
         yield* llm.text("reflection complete")
         yield* llm.text("first idle round after reflection")
 
@@ -3281,7 +3380,7 @@ it.instance(
           arguments: "start 200ms",
         })
 
-        yield* llm.wait(5)
+        yield* llm.wait(4)
         yield* pollWithTimeout(
           Effect.gen(function* () {
             const stateMap = yield* prompt.loopState()
@@ -3307,7 +3406,8 @@ it.instance(
 
         const inputs = yield* llm.inputs
         expect(JSON.stringify(inputs)).toContain("Reflection trigger")
-        expect(JSON.stringify(inputs)).toContain("cycle-reflect")
+        expect(JSON.stringify(inputs)).toContain("Challenge stale assumptions")
+        expect(JSON.stringify(inputs)).toContain("Do not load cycle-reflect with the skill tool")
         expect(JSON.stringify(inputs)).not.toContain("Planning escalation")
 
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "stop" })
@@ -3380,13 +3480,12 @@ it.instance(
         const { llm } = yield* useServerConfig(providerCfg)
         const { prompt, chat } = yield* boot()
         yield* llm.text("idle before reflection")
-        yield* llm.tool("skill", { name: "cycle-reflect" })
         yield* llm.text("reflection complete")
         yield* llm.text("post-reflection idle one")
         yield* llm.text("post-reflection idle two")
         yield* llm.text("post-reflection idle three")
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
-        yield* llm.wait(6)
+        yield* llm.wait(5)
         yield* pollWithTimeout(
           Effect.gen(function* () {
             const stateMap = yield* prompt.loopState()
@@ -3427,7 +3526,6 @@ it.instance(
         const { llm } = yield* useServerConfig(providerCfg)
         const { prompt, chat } = yield* boot()
         yield* llm.text("idle before first reflection")
-        yield* llm.tool("skill", { name: "cycle-reflect" })
         yield* llm.text("first reflection complete")
         yield* llm.tool("glob", { pattern: "**/*.ts" })
         yield* llm.text("useful activity complete")
@@ -3435,7 +3533,7 @@ it.instance(
         yield* llm.text("second reflection complete")
 
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
-        yield* llm.wait(7)
+        yield* llm.wait(6)
         yield* pollWithTimeout(
           Effect.gen(function* () {
             const state = (yield* prompt.loopState())[chat.id]
@@ -3515,13 +3613,12 @@ it.instance(
         const { llm } = yield* useServerConfig(providerCfg)
         const { prompt, chat } = yield* boot()
         yield* llm.text("idle before reflection")
-        yield* llm.tool("skill", { name: "cycle-reflect" })
         yield* llm.text("reflection complete")
         yield* llm.text("No changes since #40-129; waiting for redirection.")
         yield* llm.text("No changes since #40-130; waiting for redirection.")
         yield* llm.text("No changes since #40-131; waiting for redirection.")
         yield* prompt.command({ sessionID: chat.id, command: "cycle", arguments: "start 100ms" })
-        yield* llm.wait(6)
+        yield* llm.wait(5)
         yield* pollWithTimeout(
           Effect.gen(function* () {
             const state = (yield* prompt.loopState())[chat.id]

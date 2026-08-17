@@ -75,7 +75,7 @@ describe("skill", () => {
           expect(builtins).toContainEqual(
             expect.objectContaining({
               name: "cycle-reflect",
-              description: expect.stringContaining("three consecutive rounds without tool activity"),
+              description: expect.stringContaining("scheduler injects this content directly"),
             }),
           )
         }),

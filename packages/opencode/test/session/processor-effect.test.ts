@@ -1277,6 +1277,8 @@ itStall.live("session.processor stall watchdog fails a silent stream", () =>
           const value = yield* handle.process(stallInput(parent, chat.id, mdl))
           expect(value).toBe("stop")
           expect(JSON.stringify(handle.message.error)).toContain("stalled")
+          expect(handle.message.finish).toBe("error")
+          expect(handle.message.time.completed).toBeNumber()
         } finally {
           SessionProcessor.processorConfig.stallTimeoutMs = originalTimeout
           SessionProcessor.processorConfig.stallCheckMs = originalCheck
