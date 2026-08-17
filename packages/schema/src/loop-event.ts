@@ -11,7 +11,11 @@ export const LoopState = Schema.Struct({
   // fields) decodable without making the fields optional on encode.
   mode: Schema.Literal("cycle").pipe(Schema.withDecodingDefaultKey(Effect.succeed("cycle" as const))),
   intervalStr: Schema.String,
+  model: optional(Schema.String),
   rounds: NonNegativeInt,
+  successfulRounds: NonNegativeInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
+  failedRounds: NonNegativeInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
+  interruptedRounds: NonNegativeInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
   startedAt: Schema.Number,
   nextRunAt: Schema.Number,
   paused: Schema.Boolean,
@@ -21,6 +25,8 @@ export const LoopState = Schema.Struct({
   consecutiveDry: NonNegativeInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
   coalescedCount: NonNegativeInt,
   lastStatus: optional(Schema.Literals(["success", "fail"])),
+  lastError: optional(Schema.String),
+  pauseReason: optional(Schema.String),
 }).annotate({ identifier: "LoopState" })
 export type LoopState = Schema.Schema.Type<typeof LoopState>
 

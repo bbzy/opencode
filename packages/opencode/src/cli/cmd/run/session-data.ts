@@ -195,13 +195,15 @@ function formatLoopState(state: LoopState2): string {
   const consecutiveDry = state.consecutiveDry ?? 0
   const activity = `${consecutiveDry} tool-free`
   const dry = consecutiveDry > 0 ? ` ${activity}` : ""
+  const failed = state.lastStatus === "fail" ? " failed" : ""
   if (state.paused) {
-    const reason = consecutiveDry > 0 ? `paused, ${activity}` : "paused"
+    const pause = state.pauseReason ? `paused: ${state.pauseReason}` : "paused"
+    const reason = consecutiveDry > 0 ? `${pause}, ${activity}` : pause
     return `CYCLE ${round}(${reason})`.trim()
   }
-  if (state.running) return `CYCLE ${round}(running${dry})`.trim()
-  if (state.pending) return `CYCLE ${round}(queued${dry})`.trim()
-  return `CYCLE ${round}(${state.intervalStr})${dry}`.trim()
+  if (state.running) return `CYCLE ${round}(running${failed}${dry})`.trim()
+  if (state.pending) return `CYCLE ${round}(queued${failed}${dry})`.trim()
+  return `CYCLE ${round}(${state.intervalStr}${failed})${dry}`.trim()
 }
 
 function patch(patch?: FooterPatch, view?: FooterView): FooterOutput | undefined {
