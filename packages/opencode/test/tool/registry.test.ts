@@ -94,12 +94,52 @@ const withEmptyCodeMode = testEffect(
   ]),
 )
 const withBrokenPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
+const withImageModels = testEffect(
+  LayerNode.compile(root, [
+    [
+      Config.node,
+      TestConfig.layer({
+        get: () => Effect.succeed({ image_models: ["test/vision"] }),
+        directories: () => InstanceState.directory.pipe(Effect.map((dir) => [path.join(dir, ".opencode")])),
+      }),
+    ],
+    [RuntimeFlags.node, RuntimeFlags.layer()],
+  ]),
+)
 
 afterEach(async () => {
   await disposeAllInstances()
 })
 
 describe("tool.registry", () => {
+  it.instance("does not expose view_image without image models", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+
+      expect(tools.map((tool) => tool.id)).not.toContain("view_image")
+    }),
+  )
+
+  withImageModels.instance("exposes view_image with image models", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+
+      expect(tools.map((tool) => tool.id)).toContain("view_image")
+    }),
+  )
+
   it.instance("does not expose task_status", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
