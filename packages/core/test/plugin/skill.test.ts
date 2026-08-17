@@ -42,7 +42,7 @@ describe("SkillPlugin.Plugin", () => {
       expect(yield* skill.list()).toContainEqual(
         expect.objectContaining({
           name: "cycle-reflect",
-          description: expect.stringContaining("three consecutive rounds without tool activity"),
+          description: expect.stringContaining("scheduler injects this content directly"),
         }),
       )
       const reflect = (yield* skill.list()).find((item) => item.name === "cycle-reflect")

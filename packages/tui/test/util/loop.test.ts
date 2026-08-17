@@ -7,6 +7,9 @@ function makeState(overrides: Partial<LoopState2> = {}): LoopState2 {
     mode: "cycle",
     intervalStr: "every 5m",
     rounds: 3,
+    successfulRounds: 3,
+    failedRounds: 0,
+    interruptedRounds: 0,
     startedAt: 1700000000000,
     nextRunAt: 1700000100000,
     paused: false,
@@ -39,6 +42,11 @@ describe("util.loop.formatLoopState", () => {
     expect(formatLoopState(state)).toBe("CYCLE #5(paused)")
   })
 
+  test("paused shows the pause reason", () => {
+    const state = makeState({ rounds: 5, paused: true, pauseReason: "iteration interrupted" })
+    expect(formatLoopState(state)).toBe("CYCLE #5(paused: iteration interrupted)")
+  })
+
   test("paused with 0 rounds", () => {
     const state = makeState({ rounds: 0, paused: true })
     expect(formatLoopState(state)).toBe("CYCLE (paused)")
@@ -62,6 +70,13 @@ describe("util.loop.formatLoopState", () => {
   test("active without paused, running, or pending shows interval", () => {
     const state = makeState({ rounds: 1 })
     expect(formatLoopState(state)).toBe("CYCLE #1(every 5m)")
+  })
+
+  test("last failed outcome is visible", () => {
+    expect(formatLoopState(makeState({ rounds: 2, lastStatus: "fail" }))).toBe("CYCLE #2(every 5m failed)")
+    expect(formatLoopState(makeState({ rounds: 2, running: true, lastStatus: "fail" }))).toBe(
+      "CYCLE #2(running failed)",
+    )
   })
 
   test("no-progress iterations show dry count", () => {

@@ -29,6 +29,11 @@ function round(...tools: SessionV1.Part[]) {
 }
 
 describe("session cycle scheduling", () => {
+  test("reflects after two dry rounds and pauses after one post-reflection dry round", () => {
+    expect(Loop.loopConfig.maxDryIterations).toBe(2)
+    expect(Loop.loopConfig.maxPostReflectionDryIterations).toBe(1)
+  })
+
   test("parses compound durations", () => {
     expect(Loop.parseDuration("2h30m")).toBe(9_000_000)
     expect(Loop.parseDuration("5 minutes")).toBeUndefined()
@@ -56,26 +61,31 @@ describe("session cycle scheduling", () => {
     })
     expect(prompt).toContain("[Cycle #5] Automated cycle — iteration 5.")
     expect(prompt).not.toContain("Last completed iteration")
-    expect(prompt).toContain("Tool activity: 2/3 consecutive completed rounds without a tool call")
+    expect(prompt).toContain(
+      `Tool activity: 2/${Loop.loopConfig.maxDryIterations} consecutive completed rounds without a tool call`,
+    )
     expect(prompt).not.toContain("duplicate delivery")
     expect(prompt).not.toContain("CYCLE_OUTCOME")
   })
 
-  test("cycle requests the reflection skill without imposing a phase sequence", () => {
+  test("cycle injects the reflection contract without imposing a phase sequence", () => {
     const reflect = Loop.buildCyclePrompt(4, {
       consecutiveDry: Loop.loopConfig.maxDryIterations,
       postReflection: false,
     })
     expect(reflect).toContain("Reflection trigger")
-    expect(reflect).toContain("cycle-reflect skill")
+    expect(reflect).toContain("<cycle-reflect>")
+    expect(reflect).toContain("Challenge stale assumptions")
+    expect(reflect).toContain("Do not load cycle-reflect with the skill tool")
     expect(reflect).toContain("excluded from tool-activity counting")
     expect(reflect).not.toContain("Planning escalation")
 
     const afterReflect = Loop.buildCyclePrompt(5, { consecutiveDry: 1, postReflection: true })
     expect(afterReflect).not.toContain("Reflection trigger")
+    expect(afterReflect).not.toContain("<cycle-reflect>")
     expect(afterReflect).not.toContain("Planning escalation")
-    expect(afterReflect).toContain("Post-reflection tool activity: 1/3")
-    expect(afterReflect).toContain("will pause if this reaches 3")
+    expect(afterReflect).toContain(`Post-reflection tool activity: 1/${Loop.loopConfig.maxPostReflectionDryIterations}`)
+    expect(afterReflect).toContain(`will pause if this reaches ${Loop.loopConfig.maxPostReflectionDryIterations}`)
   })
 
   test("cycle round prompts omit context lines when there is nothing to report", () => {
