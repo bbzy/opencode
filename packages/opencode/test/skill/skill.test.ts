@@ -64,6 +64,30 @@ const withHome = <A, E, R>(home: string, self: Effect.Effect<A, E, R>) =>
   )
 
 describe("skill", () => {
+  it.live("discovers refine exports separately from ordinary global skills", () =>
+    Effect.gen(function* () {
+      const tmp = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir({ git: true })),
+        (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+      )
+      const file = path.join(Global.Path.config, "refine", "skills", "refined-procedure", "SKILL.md")
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() => fs.rm(path.dirname(file), { recursive: true, force: true })),
+      )
+      yield* Effect.promise(async () => {
+        await fs.mkdir(path.dirname(file), { recursive: true })
+        await Bun.write(
+          file,
+          "---\nname: refined-procedure\ndescription: Use when repeating this procedure.\n---\n\nVerify the result.\n",
+        )
+      })
+      yield* Effect.gen(function* () {
+        const skill = yield* Skill.Service
+        expect((yield* skill.all()).find((entry) => entry.name === "refined-procedure")?.location).toBe(file)
+      }).pipe(provideInstance(tmp.path))
+    }),
+  )
+
   it.live("registers the built-in Cycle owner and reflection skills", () =>
     provideTmpdirInstance(
       () =>

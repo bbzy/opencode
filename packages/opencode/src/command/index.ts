@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { CommandPlugin } from "@opencode-ai/core/plugin/command"
 import path from "path"
 import { InstanceState } from "@/effect/instance-state"
 import { EffectBridge } from "@/effect/bridge"
@@ -46,6 +47,7 @@ export function hints(template: string) {
 export const Default = {
   INIT: "init",
   REVIEW: "review",
+  REFINE: "refine",
   CYCLE: "cycle",
 } as const
 
@@ -93,6 +95,14 @@ const layer = Layer.effect(
         source: "command",
         template: "",
         hints: [],
+      }
+      commands[Default.REFINE] = {
+        name: Default.REFINE,
+        description: CommandPlugin.RefineDescription,
+        source: "command",
+        template: CommandPlugin.RefineTemplate.replaceAll("${path}", ctx.worktree),
+        subtask: false,
+        hints: hints(CommandPlugin.RefineTemplate),
       }
 
       for (const [name, command] of Object.entries(cfg.command ?? {})) {

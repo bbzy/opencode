@@ -5,6 +5,10 @@ import { Effect } from "effect"
 import { Location } from "../location"
 import PROMPT_INITIALIZE from "./command/initialize.txt"
 import PROMPT_REVIEW from "./command/review.txt"
+import PROMPT_REFINE from "./command/refine.txt"
+
+export const RefineTemplate = PROMPT_REFINE
+export const RefineDescription = "refine lessons and manage memories [focus|status|list|history|rollback|export]"
 
 export const Plugin = define({
   id: "command",
@@ -19,6 +23,11 @@ export const Plugin = define({
         command.template = PROMPT_REVIEW.replace("${path}", location.project.directory)
         command.description = "review changes [commit|branch|pr], defaults to uncommitted"
         command.subtask = true
+      })
+      draft.update("refine", (command) => {
+        command.template = RefineTemplate.replaceAll("${path}", location.project.directory)
+        command.description = RefineDescription
+        command.subtask = false
       })
     })
   }),

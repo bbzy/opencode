@@ -18,6 +18,9 @@ import { WebFetchTool } from "./webfetch"
 import { WriteTool } from "./write"
 import { InvalidTool } from "./invalid"
 import { SkillTool } from "./skill"
+import { MemoryTool } from "./memory"
+import { Refinement } from "@opencode-ai/core/refinement"
+import { RefinementRunner } from "@opencode-ai/core/refinement/runner"
 import * as Tool from "./tool"
 import { Config } from "@/config/config"
 import { type ToolContext as PluginToolContext, type ToolDefinition } from "@opencode-ai/plugin"
@@ -116,6 +119,7 @@ const layer = Layer.effect(
     const greptool = yield* GrepTool
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
+    const memorytool = yield* MemoryTool
     const viewimage = yield* ViewImageTool
     const agent = yield* Agent.Service
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
@@ -223,6 +227,7 @@ const layer = Layer.effect(
           todo: Tool.init(todo),
           search: Tool.init(websearch),
           skill: Tool.init(skilltool),
+          memory: Tool.init(memorytool),
           patch: Tool.init(patchtool),
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
@@ -237,6 +242,7 @@ const layer = Layer.effect(
             ...(questionEnabled ? [tool.question] : []),
             tool.shell,
             tool.read,
+            tool.memory,
             ...(cfg.image_models?.length ? [tool.viewImage] : []),
             tool.glob,
             tool.grep,
@@ -445,6 +451,8 @@ export const node = LayerNode.make({
     Todo.node,
     Agent.node,
     Skill.node,
+    Refinement.node,
+    RefinementRunner.node,
     Session.node,
     BackgroundJob.node,
     Provider.node,

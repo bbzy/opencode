@@ -74,7 +74,10 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { Loop } from "./loop"
+import { Refinement } from "@opencode-ai/core/refinement"
+import { RefinementRunner } from "@opencode-ai/core/refinement/runner"
 import { LoopEvent } from "@opencode-ai/schema/loop-event"
+import { TuiEvent } from "@opencode-ai/schema/tui-event"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
 import { LLMEvent } from "@opencode-ai/llm"
 import { Todo } from "./todo"
@@ -204,6 +207,8 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
     const todos = yield* Todo.Service
+    const memories = yield* Refinement.Service
+    const refinement = yield* RefinementRunner.Service
     const { db } = database
     const activeCycles = new Map<SessionID, Loop.LoopState>()
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
@@ -216,6 +221,7 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
+      yield* refinement.cancelPending(sessionID)
       yield* state.cancel(sessionID)
     })
 
@@ -1168,6 +1174,81 @@ const layer = Layer.effect(
       throw new Error("Impossible")
     })
 
+    const refine = Effect.fn("SessionPrompt.refine")(function* (
+      sessionID: SessionID,
+      compact = false,
+      request?: typeof RefinementRunner.Request.Type,
+    ) {
+      const messages = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+        Effect.provideService(Database.Service, database),
+      )
+      const latest = MessageV2.latest(messages)
+      if (!latest.user) return
+      const user = latest.user
+      const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+      const agent = yield* agents.get(user.agent)
+      if (!agent) return
+      const model = yield* getModel(user.model.providerID, user.model.modelID, sessionID)
+      return yield* refinement.checkpoint({
+        sessionID,
+        turnID: latest.assistant?.id ?? user.id,
+        permission: (scope) =>
+          Permission.evaluate("edit", `memory:${scope}:*`, agent.permission, session.permission ?? []).action,
+        notify: (outcome) =>
+          events
+            .publish(TuiEvent.ToastShow, {
+              title: `Refinement (${sessionID}, ${outcome.scope})`,
+              message: outcome.message,
+              variant: outcome.status === "failed" ? "error" : outcome.status === "completed" ? "success" : "info",
+              duration: 10000,
+            })
+            .pipe(Effect.asVoid),
+        child: !!session.parentID,
+        compact,
+        request,
+        config: (yield* config.get()).refinement,
+        trajectory: JSON.stringify(
+          messages.map((message) => ({
+            role: message.info.role,
+            parts: message.parts.filter((part) => part.type === "text" || part.type === "tool"),
+          })),
+        ),
+        complete: (system, text) =>
+          llm
+            .stream({
+              user,
+              agent,
+              model,
+              sessionID,
+              system: [system],
+              tools: {},
+              toolChoice: "none",
+              messages: [{ role: "user", content: text }],
+              retries: 1,
+            })
+            .pipe(
+              Stream.tap((event) =>
+                LLMEvent.is.providerError(event)
+                  ? Effect.fail(new Refinement.Error({ message: event.message }))
+                  : Effect.void,
+              ),
+              Stream.filter(LLMEvent.is.textDelta),
+              Stream.map((event) => event.text),
+              Stream.mkString,
+              Effect.mapError((error) => new Refinement.Error({ message: String(error) })),
+            ),
+      })
+    })
+    const autoRefine = (sessionID: SessionID, compact = false) =>
+      refine(sessionID, compact).pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.failCause(cause)
+            : Effect.logWarning("refinement failed", { cause: Cause.pretty(cause) }),
+        ),
+        Effect.orDie,
+      )
+
     // prettier-ignore
     const runLoop: RunLoop = Effect.fn("SessionPrompt.run")(
       function* (sessionID: SessionID, options?: RunLoopOptions) {
@@ -1241,6 +1322,7 @@ const layer = Layer.effect(
             }
 
             if (task?.type === "compaction") {
+              yield* autoRefine(sessionID, true)
               const cycle = activeCycles.get(sessionID)
               const cycleCompaction = cycle !== undefined && !cycle.paused
               const result = yield* compaction.process({
@@ -1372,6 +1454,7 @@ const layer = Layer.effect(
               const system = [
                 ...env,
                 ...instructions,
+                yield* memories.context(sessionID).pipe(Effect.catch(() => Effect.succeed(""))),
                 ...(mcpInstructions ? [mcpInstructions] : []),
                 ...(skills ? [skills] : []),
               ]
@@ -1609,13 +1692,16 @@ const layer = Layer.effect(
               Effect.ensuring(instruction.clear(handle.message.id)),
               Effect.onInterrupt(() => finalizeInterruptedAssistant),
             )
+            if (!handle.message.error && handle.message.finish && handle.message.finish !== "unknown")
+              yield* autoRefine(sessionID)
             if (outcome === "break") break
             continue
           }
 
           yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
-          return yield* lastAssistant(sessionID)
-        })
+          const result = yield* lastAssistant(sessionID)
+          return result
+        }).pipe(Effect.onInterrupt(() => refinement.cancelPending(sessionID)))
       },
     )
 
@@ -1647,6 +1733,7 @@ const layer = Layer.effect(
       const model = yield* getModel(lastFinished.providerID, lastFinished.modelID, sessionID)
       const limit = usable({ cfg: yield* config.get(), model, outputTokenMax: flags.outputTokenMax })
       if (limit === 0 || count < limit * Loop.loopConfig.compactionThreshold) return false
+      yield* autoRefine(sessionID, true)
       yield* compaction.create({
         sessionID,
         agent: lastFinished.agent,
@@ -2437,6 +2524,73 @@ const layer = Layer.effect(
         agent: input.agent,
       })
       if (input.command === "cycle" || input.command === "loop") return yield* handleAutomationCommand(input)
+      if (input.command === "refine" && !(yield* config.get()).command?.refine) {
+        const args = input.arguments.trim().split(/\s+/).filter(Boolean)
+        const target = {
+          sessionID: input.sessionID,
+          scope: args.includes("--global") ? ("global" as const) : ("local" as const),
+        }
+        const words = args.filter((arg) => arg !== "--global")
+        if (words[0] === "help")
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            "/refine [focus] [--global]\n/refine status|list|history [--global]\n/refine rollback <id> [--global]\n/refine export <skill-id> [--global]",
+          )
+        if (words[0] === "status")
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            JSON.stringify(yield* refinement.status(input.sessionID)),
+          )
+        if (words[0] === "history" || words[0] === "list") {
+          const stored = yield* memories.read(target).pipe(Effect.orDie)
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            JSON.stringify(words[0] === "history" ? stored.history.slice(-20) : stored.entries, null, 2),
+          )
+        }
+        if (words[0] === "rollback") {
+          if (!words[1])
+            return yield* noReply(input.sessionID, input.messageID, "Usage: /refine rollback <id> [--global]")
+          const restored = yield* memories.rollback(target, words[1]).pipe(Effect.orDie)
+          return yield* noReply(input.sessionID, input.messageID, JSON.stringify(restored.history.at(-1)))
+        }
+        if (words[0] === "export") {
+          if (!words[1])
+            return yield* noReply(input.sessionID, input.messageID, "Usage: /refine export <skill-id> [--global]")
+          const file = yield* memories.exportSkill(target, words[1]).pipe(Effect.orDie)
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            `Exported ${file}. Restart opencode to refresh skill discovery.`,
+          )
+        }
+        const request = { scope: target.scope, instructions: (words[0] === "run" ? words.slice(1) : words).join(" ") }
+        yield* refinement.request(input.sessionID, request)
+        if ((yield* status.get(input.sessionID)).type === "busy") {
+          return yield* noReply(
+            input.sessionID,
+            input.messageID,
+            "Refinement scheduled for the next provider-turn boundary. Use /refine status to inspect the outcome.",
+          )
+        }
+        return yield* state.ensureRunning(
+          input.sessionID,
+          lastAssistant(input.sessionID),
+          Effect.gen(function* () {
+            const result = yield* refine(input.sessionID, false, request).pipe(Effect.orDie)
+            return yield* noReply(
+              input.sessionID,
+              input.messageID,
+              result
+                ? `Refinement ${result.id}: ${result.summary}\n${result.changes.map((change) => `${change.kind}:${change.id}`).join("\n")}`
+                : "No reusable changes to save.",
+            )
+          }).pipe(Effect.orDie),
+        )
+      }
       const cmd = yield* commands.get(input.command)
       if (!cmd) {
         const available = (yield* commands.list()).map((c) => c.name)
@@ -2735,6 +2889,8 @@ export const node = LayerNode.make({
     RuntimeFlags.node,
     Database.node,
     Todo.node,
+    Refinement.node,
+    RefinementRunner.node,
   ],
 })
 

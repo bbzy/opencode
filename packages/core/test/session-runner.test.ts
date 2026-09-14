@@ -1,4 +1,9 @@
-import { describe, expect } from "bun:test"
+import { afterAll, describe, expect } from "bun:test"
+import path from "path"
+import { tmpdir } from "./fixture/tmpdir"
+import { Global } from "@opencode-ai/core/global"
+import { RefinementRunner } from "@opencode-ai/core/refinement/runner"
+import { TuiEvent } from "@opencode-ai/schema/tui-event"
 import {
   LLMClient,
   LLMError,
@@ -39,6 +44,7 @@ import { ToolRegistry } from "@opencode-ai/core/tool/registry"
 import { ApplicationTools } from "@opencode-ai/core/tool/application-tools"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Config } from "@opencode-ai/core/config"
+import { Refinement } from "@opencode-ai/core/refinement"
 import { ConfigCompaction } from "@opencode-ai/core/config/compaction"
 import { Tool } from "@opencode-ai/core/tool/tool"
 import {
@@ -216,6 +222,7 @@ const config = Layer.succeed(
         new Config.Document({
           type: "document",
           info: new Config.Info({
+            refinement: { auto: false },
             compaction: new ConfigCompaction.Info({
               buffer: 3_000,
               keep: new ConfigCompaction.Keep({ tokens: 1_000 }),
@@ -225,7 +232,31 @@ const config = Layer.succeed(
       ]),
   }),
 )
+const refinementDirectory = await tmpdir()
+afterAll(() => refinementDirectory[Symbol.asyncDispose]())
+const memories = Layer.effect(
+  Refinement.Service,
+  Effect.gen(function* () {
+    const store = yield* Refinement.Service
+    return Refinement.Service.of({
+      ...store,
+      // Existing coordinator fixtures use synchronous empty context. Exercise disk
+      // context only in the refinement integration session.
+      context: (id) => (id === "ses_runner_refinement" ? store.context(id) : Effect.succeed("")),
+    })
+  }),
+).pipe(
+  Layer.provide(
+    AppNodeBuilder.build(Refinement.node, [
+      [
+        Global.node,
+        Global.layerWith({ data: refinementDirectory.path, config: path.join(refinementDirectory.path, "config") }),
+      ],
+    ]),
+  ),
+)
 const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
+  [Refinement.node, memories],
   [Snapshot.node, Snapshot.noopLayer],
   [LayerNodePlatform.llmClient, client],
   [SessionRunnerModel.node, models],
@@ -273,6 +304,7 @@ const it = testEffect(
       SessionRunnerLLM.node,
       SessionExecution.node,
       SessionV2.node,
+      RefinementRunner.node,
     ]),
     [
       [LayerNodePlatform.llmClient, client],
@@ -285,6 +317,7 @@ const it = testEffect(
       [Snapshot.node, Snapshot.noopLayer],
       [SessionExecution.node, execution],
       [Config.node, config],
+      [Refinement.node, memories],
     ],
   ),
 )
@@ -1466,6 +1499,84 @@ describe("SessionRunnerLLM", () => {
           ],
         },
       ])
+    }),
+  )
+
+  it.effect("interruption drops pending refine without running it on the next task", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const runner = yield* RefinementRunner.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Start working" }), resume: false })
+      streamGate = yield* Deferred.make<void>()
+      streamStarted = yield* Deferred.make<void>()
+      requests.length = 0
+      const fiber = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      yield* Deferred.await(streamStarted)
+      yield* runner.request(sessionID, { scope: "global" })
+      yield* session.interrupt(sessionID)
+      yield* Fiber.await(fiber)
+      expect(yield* runner.status(sessionID)).toMatchObject({
+        pending: false,
+        outcome: { status: "cancelled", scope: "global" },
+      })
+      streamGate = undefined
+      streamStarted = undefined
+      response = fragmentFixture("text", "next-task", ["Done"]).completeEvents
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Unrelated task" }), resume: false })
+      yield* session.resume(sessionID)
+      expect(requests).toHaveLength(2)
+    }),
+  )
+
+  it.live("refine runs after tool settlement and updates context before the next provider turn", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const session = yield* SessionV2.Service
+      const runner = yield* RefinementRunner.Service
+      const events = yield* EventV2.Service
+      const notices: string[] = []
+      yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === TuiEvent.ToastShow.type)
+            notices.push(Schema.decodeUnknownSync(TuiEvent.ToastShow.data)(event.data).message)
+        }),
+      )
+      const id = SessionV2.ID.make("ses_runner_refinement")
+      yield* insertSession(id)
+      yield* session.prompt({ sessionID: id, prompt: Prompt.make({ text: "Learn while working" }), resume: false })
+      yield* runner.request(id, {})
+      requests.length = 0
+      responses = [
+        [
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolCall({ id: "call-refine", name: "echo", input: { text: "verified tool result" } }),
+          LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
+          LLMEvent.finish({ reason: "tool-calls" }),
+        ],
+        fragmentFixture("text", "proposal", [
+          JSON.stringify({
+            summary: "Learn from the tool result",
+            edits: [
+              {
+                action: "create",
+                kind: "memory",
+                id: "tool-lesson",
+                title: "Tool lesson",
+                content: "Verify package tests before continuing.",
+                evidence: "Tool finished successfully.",
+              },
+            ],
+          }),
+        ]).completeEvents,
+        fragmentFixture("text", "final", ["Done"]).completeEvents,
+      ]
+      yield* session.resume(id)
+      expect(requests).toHaveLength(3)
+      expect(JSON.stringify(requests[1]?.messages)).toContain("verified tool result")
+      expect(JSON.stringify(requests[2])).toContain("Verify package tests before continuing.")
+      expect(yield* runner.status(id)).toMatchObject({ turns: 1, outcome: { status: "completed" } })
+      expect(notices.some((message) => message.includes("Learn from the tool result"))).toBe(true)
     }),
   )
 

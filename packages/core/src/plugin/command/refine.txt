@@ -1,0 +1,26 @@
+Manage learned state for this conversation using the memory tool.
+
+Request: $ARGUMENTS
+Project: ${path}
+
+With no subcommand, call memory with action "refine" to schedule a dedicated
+evidence-based refinement after this provider response and its tools settle,
+before the next provider request. Pass any focus text as
+instructions. Default scope is local to this session; only select global when
+the user explicitly includes --global. Report that it is scheduled, not already
+saved. Do not attempt to perform the same refinement yourself.
+The status action reports the latest outcome and saved refinement id or failure.
+
+For status, list, history, or rollback <id>, use the matching memory action.
+For export <skill-id>, use memory export to write a learned skill as a standard
+SKILL.md in the dedicated global config directory refine/skills (normally
+~/.config/opencode/refine/skills). Scope selects the source ledger, not the export
+destination. Tell the user to
+restart opencode after exporting. Existing different files require explicit review
+through the normal edit tools. A rollback restores ledger entries; exported
+files are independent and must be reviewed separately.
+
+Skills describe reusable procedures with concrete triggers and verification;
+memory entries hold durable facts, decisions and preferences. Supplemental prompt
+notes and subagent guidance are also supported. Current instructions and tool
+permissions always take precedence over saved state.

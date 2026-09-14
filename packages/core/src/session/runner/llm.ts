@@ -22,6 +22,11 @@ import { SystemContext } from "../../system-context/index"
 import { SystemContextRegistry } from "../../system-context/registry"
 import { SkillGuidance } from "../../skill/guidance"
 import { ReferenceGuidance } from "../../reference/guidance"
+import { Refinement } from "../../refinement"
+import { RefinementContext } from "../../refinement/context"
+import { RefinementRunner } from "../../refinement/runner"
+import { ConfigRefinement } from "../../config/refinement"
+import { TuiEvent } from "@opencode-ai/schema/tui-event"
 import { ToolRegistry } from "../../tool/registry"
 import { ToolOutputStore } from "../../tool-output-store"
 import { SessionContextEpoch } from "../context-epoch"
@@ -104,9 +109,20 @@ const layer = Layer.effect(
     const skillGuidance = yield* SkillGuidance.Service
     const referenceGuidance = yield* ReferenceGuidance.Service
     const config = yield* Config.Service
+    const memories = yield* Refinement.Service
+    const refinement = yield* RefinementRunner.Service
     const snapshots = yield* Snapshot.Service
     const db = (yield* Database.Service).db
-    const compaction = SessionCompaction.make({ events, llm, config: yield* config.entries() })
+    const documents = yield* config.entries()
+    const refinementConfig = documents
+      .filter((entry): entry is Config.Document => entry.type === "document")
+      .reduce<typeof ConfigRefinement.Info.Type>((result, entry) => ({ ...result, ...entry.info.refinement }), {})
+    const compaction = SessionCompaction.make({
+      events,
+      llm,
+      config: documents,
+      beforeCompact: (sessionID) => autoRefine(sessionID, true),
+    })
     const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
       const session = yield* store.get(sessionID)
       if (!session) return yield* Effect.die(`Session not found: ${sessionID}`)
@@ -116,6 +132,66 @@ const layer = Layer.effect(
     const getContext = Effect.fn("SessionRunner.getContext")(function* (sessionID: SessionSchema.ID) {
       return yield* store.context(sessionID)
     })
+    const autoRefine = Effect.fn("SessionRunner.refine")(
+      function* (sessionID: SessionSchema.ID, compact = false) {
+        const session = yield* getSession(sessionID)
+        const agent = yield* agents.select(session.agent)
+        const context = yield* getContext(sessionID)
+        const last = context.findLast((message) => message.type === "assistant")
+        if (!compact && (last?.type !== "assistant" || last.error)) return
+        yield* refinement.checkpoint({
+          sessionID,
+          turnID: last?.id ?? sessionID,
+          permission: (scope) =>
+            PermissionV2.evaluate("edit", `memory:${scope}:*`, agent.info?.permissions ?? []).effect,
+          notify: (outcome) =>
+            events
+              .publish(
+                TuiEvent.ToastShow,
+                {
+                  title: `Refinement (${sessionID}, ${outcome.scope})`,
+                  message: outcome.message,
+                  variant: outcome.status === "failed" ? "error" : outcome.status === "completed" ? "success" : "info",
+                  duration: 10000,
+                },
+                { location },
+              )
+              .pipe(Effect.asVoid),
+          child: !!session.parentID,
+          compact,
+          config: refinementConfig,
+          trajectory: JSON.stringify(context),
+          complete: (system, text) =>
+            Effect.gen(function* () {
+              const model = yield* models.resolve(session)
+              return yield* llm
+                .stream(
+                  LLM.request({
+                    model,
+                    system: [SystemPart.make(system)],
+                    messages: [Message.user(text)],
+                    tools: [],
+                    toolChoice: "none",
+                  }),
+                )
+                .pipe(
+                  Stream.tap((event) =>
+                    LLMEvent.is.providerError(event)
+                      ? Effect.fail(new Refinement.Error({ message: event.message }))
+                      : Effect.void,
+                  ),
+                  Stream.filter(LLMEvent.is.textDelta),
+                  Stream.map((event) => event.text),
+                  Stream.mkString,
+                )
+            }).pipe(Effect.mapError((error) => new Refinement.Error({ message: String(error) }))),
+        })
+      },
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause) ? Effect.interrupt : Effect.logWarning("refinement failed", cause),
+      ),
+      Effect.asVoid,
+    )
     const failInterruptedTools = Effect.fn("SessionRunner.failInterruptedTools")(function* (
       sessionID: SessionSchema.ID,
     ) {
@@ -165,10 +241,18 @@ const layer = Layer.effect(
     const continueAfterOverflowCompaction = (step: number) =>
       new TurnTransitionError({ _tag: "ContinueAfterOverflowCompaction", step })
 
-    const loadSystemContext = (agent: AgentV2.Selection) =>
-      Effect.all([systemContext.load(), skillGuidance.load(agent), referenceGuidance.load()], {
-        concurrency: "unbounded",
-      }).pipe(Effect.map(SystemContext.combine))
+    const loadSystemContext = (agent: AgentV2.Selection, sessionID: SessionSchema.ID) =>
+      Effect.all(
+        [
+          systemContext.load(),
+          skillGuidance.load(agent),
+          referenceGuidance.load(),
+          RefinementContext.load(memories, sessionID),
+        ],
+        {
+          concurrency: "unbounded",
+        },
+      ).pipe(Effect.map(SystemContext.combine))
 
     const runTurnAttempt = Effect.fn("SessionRunner.runTurn")(function* (
       sessionID: SessionSchema.ID,
@@ -180,7 +264,7 @@ const layer = Layer.effect(
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
         return yield* Effect.interrupt
       const agent = yield* agents.select(session.agent)
-      const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(agent), session.id)
+      const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(agent, session.id), session.id)
       const toolFibers = yield* FiberSet.make<void, ToolOutputStore.Error>()
       let needsContinuation = false
       let currentStep = step
@@ -195,7 +279,8 @@ const layer = Layer.effect(
         if (promoted > 0) currentStep = 1
       }
       const system =
-        initialized ?? (yield* SessionContextEpoch.prepare(db, events, loadSystemContext(agent), session.id))
+        initialized ??
+        (yield* SessionContextEpoch.prepare(db, events, loadSystemContext(agent, session.id), session.id))
       const model = yield* models.resolve(session)
       const entries = yield* SessionHistory.entriesForRunner(db, session.id, system.baselineSeq)
       const context = entries.map((entry) => entry.message)
@@ -402,6 +487,7 @@ const layer = Layer.effect(
         let step = 1
         while (needsContinuation) {
           const result = yield* runTurn(input.sessionID, promotion, step)
+          yield* autoRefine(input.sessionID)
           needsContinuation = result.needsContinuation
           step = result.step + 1
           promotion = "steer"
@@ -413,7 +499,7 @@ const layer = Layer.effect(
     })
 
     return Service.of({
-      run,
+      run: (input) => run(input).pipe(Effect.onInterrupt(() => refinement.cancelPending(input.sessionID))),
     })
   }),
 )
@@ -435,5 +521,7 @@ export const node = makeLocationNode({
     Config.node,
     Snapshot.node,
     Database.node,
+    Refinement.node,
+    RefinementRunner.node,
   ],
 })

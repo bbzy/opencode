@@ -6,7 +6,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Clock, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Clock, Deferred, Duration, Effect, Exit, Fiber, Layer, Schema } from "effect"
 import * as Scope from "effect/Scope"
 import path from "path"
 import { fileURLToPath } from "url"
@@ -30,6 +30,9 @@ import { SessionMessageTable } from "@opencode-ai/core/session/sql"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Refinement } from "@opencode-ai/core/refinement"
+import { RefinementRunner } from "@opencode-ai/core/refinement/runner"
+import { TuiEvent } from "@opencode-ai/schema/tui-event"
 import { SessionCompaction } from "../../src/session/compaction"
 import { SessionSummary } from "../../src/session/summary"
 import { Instruction } from "../../src/session/instruction"
@@ -188,6 +191,8 @@ const promptRoot = LayerNode.group([
   LSP.node,
   MCP.node,
   FSUtil.node,
+  Refinement.node,
+  RefinementRunner.node,
   BackgroundJob.node,
   SessionStatus.node,
   SessionRunState.node,
@@ -316,7 +321,7 @@ const writeText = Effect.fn("test.writeText")(function* (file: string, text: str
 const writeConfig = Effect.fn("test.writeConfig")(function* (dir: string, config: Partial<ConfigV1.Info>) {
   yield* writeText(
     path.join(dir, "opencode.json"),
-    JSON.stringify({ $schema: "https://opencode.ai/config.json", ...config }),
+    JSON.stringify({ $schema: "https://opencode.ai/config.json", refinement: { auto: false }, ...config }),
   )
 })
 
@@ -531,6 +536,236 @@ it.instance("loop exits without an LLM request for interrupted orphan tool calls
     const result = yield* prompt.loop({ sessionID: chat.id })
     expect(result.info.id).toBe(seeded.assistant.id)
     expect(yield* llm.hits).toHaveLength(0)
+  }),
+)
+
+it.instance("cancel clears pending global refine before the next task", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const runner = yield* RefinementRunner.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Start a task" }],
+    })
+    yield* llm.hang
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "provider did not start", "5 seconds")
+    yield* prompt.command({ sessionID: chat.id, command: "refine", arguments: "--global remember this task" })
+    expect((yield* runner.status(chat.id)).pending).toBe(true)
+    yield* prompt.cancel(chat.id)
+    yield* Fiber.await(fiber)
+    expect(yield* runner.status(chat.id)).toMatchObject({
+      pending: false,
+      outcome: { status: "cancelled", scope: "global" },
+    })
+    yield* llm.text("Next task complete")
+    yield* prompt.prompt({ sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "Unrelated task" }] })
+    expect(yield* llm.hits).toHaveLength(2)
+  }),
+)
+
+it.instance("refine counts provider turns within one drain and applies before continuation", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      refinement: { auto: true, turn_interval: 2, cooldown_ms: 0 },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const runner = yield* RefinementRunner.Service
+    const events = yield* EventV2Bridge.Service
+    const notices: string[] = []
+    yield* events.listen((event) =>
+      Effect.sync(() => {
+        if (event.type === TuiEvent.ToastShow.type)
+          notices.push(Schema.decodeUnknownSync(TuiEvent.ToastShow.data)(event.data).message)
+      }),
+    )
+    const chat = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Learn while working" }],
+    })
+    yield* llm.tool("first", {})
+    yield* llm.tool("second", {})
+    yield* llm.text('{"shouldRefine":true,"rationale":"verified"}')
+    yield* llm.text(
+      JSON.stringify({
+        summary: "Learn at the boundary",
+        edits: [
+          {
+            action: "create",
+            kind: "memory",
+            id: "boundary-lesson",
+            title: "Boundary lesson",
+            content: "Check package tests after editing.",
+            evidence: "Observed during this task.",
+          },
+        ],
+      }),
+    )
+    yield* llm.text("Done")
+    yield* prompt.loop({ sessionID: chat.id })
+    const hits = yield* llm.hits
+    expect(hits).toHaveLength(5)
+    expect(JSON.stringify(hits[4]?.body)).toContain("Check package tests after editing.")
+    expect((yield* runner.status(chat.id)).turns).toBe(1)
+    expect((yield* runner.status(chat.id)).outcome?.status).toBe("completed")
+    expect(notices.some((message) => message.includes("Learn at the boundary"))).toBe(true)
+  }),
+)
+
+it.instance("refine skips automatic writes when edit permission requires asking", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      refinement: { auto: true, turn_interval: 1, cooldown_ms: 0 },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const permission = yield* Permission.Service
+    const chat = yield* sessions.create({
+      permission: [{ permission: "edit", pattern: "memory:local:*", action: "ask" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Learn this" }],
+    })
+    yield* llm.text("Done")
+    yield* prompt.loop({ sessionID: chat.id })
+    expect(yield* llm.hits).toHaveLength(1)
+    expect(yield* permission.list()).toEqual([])
+  }),
+)
+
+it.instance("queued refine reports failure through toast and status without failing the task", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const runner = yield* RefinementRunner.Service
+    const events = yield* EventV2Bridge.Service
+    const notices: string[] = []
+    yield* events.listen((event) =>
+      Effect.sync(() => {
+        if (event.type === TuiEvent.ToastShow.type)
+          notices.push(Schema.decodeUnknownSync(TuiEvent.ToastShow.data)(event.data).message)
+      }),
+    )
+    const chat = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Learn while working" }],
+    })
+    yield* runner.request(chat.id, {})
+    yield* llm.tool("first", {})
+    yield* llm.text("invalid JSON")
+    yield* llm.text("Done")
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    expect(result.parts.some((part) => part.type === "text" && part.text === "Done")).toBe(true)
+    expect(yield* runner.status(chat.id)).toMatchObject({
+      pending: false,
+      running: false,
+      outcome: { status: "failed" },
+    })
+    expect(notices.some((message) => message.includes("Refinement failed"))).toBe(true)
+    expect(yield* llm.hits).toHaveLength(3)
+  }),
+)
+
+it.instance("refine automatically persists learned state after a completed turn", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      refinement: { auto: true, turn_interval: 1, cooldown_ms: 0 },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const store = yield* Refinement.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Remember the verified package test procedure" }],
+    })
+    yield* llm.text("Tests passed from the package directory.")
+    yield* llm.text('{"shouldRefine":true,"rationale":"Verified reusable lesson"}')
+    yield* llm.text(
+      JSON.stringify({
+        summary: "Remember test procedure",
+        edits: [
+          {
+            action: "create",
+            kind: "skill",
+            id: "package-tests",
+            title: "Use when running package tests",
+            content: "Run bun test from the affected package directory and check the exit status.",
+            evidence: "Tests passed from the package directory.",
+          },
+        ],
+      }),
+    )
+    yield* prompt.loop({ sessionID: chat.id })
+    const learned = yield* store.read({ sessionID: chat.id, scope: "local" })
+    expect(learned.entries).toMatchObject([{ kind: "skill", id: "package-tests" }])
+    expect(yield* llm.hits).toHaveLength(3)
+    yield* prompt.command({ sessionID: chat.id, command: "refine", arguments: `rollback ${learned.history[0]!.id}` })
+    expect((yield* store.read({ sessionID: chat.id, scope: "local" })).entries).toEqual([])
+  }),
+)
+
+it.instance("manual refine uses a dedicated proposal call with automatic refinement disabled", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const store = yield* Refinement.Service
+    const chat = yield* sessions.create({
+      title: "Pinned",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    yield* prompt.prompt({
+      sessionID: chat.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "The root test guard rejects execution; package tests work." }],
+    })
+    yield* llm.text(
+      JSON.stringify({
+        summary: "Remember package tests",
+        edits: [
+          {
+            action: "create",
+            kind: "memory",
+            id: "package-tests",
+            title: "Package test directory",
+            content: "Run tests from package directories.",
+            evidence: "User verified the root guard and package execution.",
+          },
+        ],
+      }),
+    )
+    yield* prompt.command({ sessionID: chat.id, command: "refine", arguments: "remember the test directory" })
+    expect((yield* store.read({ sessionID: chat.id, scope: "local" })).entries).toHaveLength(1)
+    expect(yield* llm.hits).toHaveLength(1)
   }),
 )
 

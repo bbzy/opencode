@@ -42,6 +42,11 @@ describe("CommandPlugin.Plugin", () => {
         description: "review changes [commit|branch|pr], defaults to uncommitted",
         subtask: true,
       })
+      expect(yield* command.get("refine")).toMatchObject({
+        name: "refine",
+        subtask: false,
+      })
+      expect((yield* command.get("refine"))?.template).toContain("Project: /repo")
     }),
   )
 })
