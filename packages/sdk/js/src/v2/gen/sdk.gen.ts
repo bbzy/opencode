@@ -121,12 +121,16 @@ import type {
   PartUpdateResponses,
   PathGetErrors,
   PathGetResponses,
+  PermissionDirectoriesErrors,
+  PermissionDirectoriesResponses,
   PermissionListErrors,
   PermissionListResponses,
   PermissionReplyErrors,
   PermissionReplyResponses,
   PermissionRespondErrors,
   PermissionRespondResponses,
+  PermissionRevokeDirectoryErrors,
+  PermissionRevokeDirectoryResponses,
   PermissionRuleset,
   PermissionV2Reply,
   PermissionV2Source,
@@ -3084,6 +3088,76 @@ export class Question extends HeyApiClient {
 
 export class Permission extends HeyApiClient {
   /**
+   * List directory grants for a session
+   */
+  public directories<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory?: string
+      workspace?: string
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "sessionID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      PermissionDirectoriesResponses,
+      PermissionDirectoriesErrors,
+      ThrowOnError
+    >({
+      url: "/permission/directory",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Revoke a directory grant
+   */
+  public revokeDirectory<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+      workspace?: string
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "sessionID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).delete<
+      PermissionRevokeDirectoryResponses,
+      PermissionRevokeDirectoryErrors,
+      ThrowOnError
+    >({
+      url: "/permission/directory/{id}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
    * List pending permissions
    *
    * Get all pending permission requests across all sessions.
@@ -3125,6 +3199,7 @@ export class Permission extends HeyApiClient {
       workspace?: string
       reply?: "once" | "always" | "reject"
       message?: string
+      scope?: "session" | "project" | "global"
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -3138,6 +3213,7 @@ export class Permission extends HeyApiClient {
             { in: "query", key: "workspace" },
             { in: "body", key: "reply" },
             { in: "body", key: "message" },
+            { in: "body", key: "scope" },
           ],
         },
       ],
@@ -5289,6 +5365,7 @@ export class Permission2 extends HeyApiClient {
       sessionID: string
       requestID: string
       reply?: PermissionV2Reply
+      scope?: "session" | "project" | "global"
       message?: string
     },
     options?: Options<never, ThrowOnError>,
@@ -5301,6 +5378,7 @@ export class Permission2 extends HeyApiClient {
             { in: "path", key: "sessionID" },
             { in: "path", key: "requestID" },
             { in: "body", key: "reply" },
+            { in: "body", key: "scope" },
             { in: "body", key: "message" },
           ],
         },

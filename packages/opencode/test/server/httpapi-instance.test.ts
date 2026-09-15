@@ -2,7 +2,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { describe, expect } from "bun:test"
-import { Config, Context, Effect, FileSystem, Layer, Path } from "effect"
+import { Config, Context, Effect, FileSystem, Layer, Path, Schema } from "effect"
 import { HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/unstable/http"
 import * as Socket from "effect/unstable/socket/Socket"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
@@ -263,3 +263,56 @@ describe("instance HttpApi", () => {
     }),
   )
 })
+
+it.live("directory grants flow through scoped replies, listing and revocation", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ git: true })
+    const created = yield* HttpClientRequest.post(SessionPaths.create).pipe(
+      directoryHeader(dir),
+      HttpClientRequest.bodyJson({ title: "directory grants" }),
+      Effect.flatMap(HttpClient.execute),
+    )
+    expect(created.status).toBe(200)
+    const session = Schema.decodeUnknownSync(Schema.Struct({ id: Schema.String }))(yield* created.json)
+    const asked = yield* HttpClientRequest.post(`/api/session/${session.id}/permission`).pipe(
+      directoryHeader(dir),
+      HttpClientRequest.bodyJson({
+        action: "external_directory",
+        resources: ["/directory-grant-test/*"],
+        save: ["/directory-grant-test/*"],
+      }),
+      Effect.flatMap(HttpClient.execute),
+    )
+    expect(asked.status).toBe(200)
+    const request = Schema.decodeUnknownSync(
+      Schema.Struct({ data: Schema.Struct({ id: Schema.String, effect: Schema.String }) }),
+    )(yield* asked.json)
+    expect(request.data.effect).toBe("ask")
+    const reply = yield* HttpClientRequest.post(`/api/session/${session.id}/permission/${request.data.id}/reply`).pipe(
+      directoryHeader(dir),
+      HttpClientRequest.bodyJson({ reply: "always", scope: "project" }),
+      Effect.flatMap(HttpClient.execute),
+    )
+    expect(reply.status).toBe(204)
+    const listed = yield* HttpClientRequest.get(`/permission/directory?sessionID=${session.id}`).pipe(
+      directoryHeader(dir),
+      HttpClient.execute,
+    )
+    expect(listed.status).toBe(200)
+    const grants = Schema.decodeUnknownSync(
+      Schema.Array(Schema.Struct({ id: Schema.String, scope: Schema.String, pattern: Schema.String })),
+    )(yield* listed.json)
+    expect(grants).toHaveLength(1)
+    expect(grants[0]).toMatchObject({ scope: "project", pattern: "/directory-grant-test/*" })
+    const removed = yield* HttpClientRequest.delete(`/permission/directory/${grants[0]!.id}?sessionID=${session.id}`).pipe(
+      directoryHeader(dir),
+      HttpClient.execute,
+    )
+    expect(removed.status).toBe(200)
+    const after = yield* HttpClientRequest.get(`/permission/directory?sessionID=${session.id}`).pipe(
+      directoryHeader(dir),
+      HttpClient.execute,
+    )
+    expect(yield* after.json).toEqual([])
+  }),
+)

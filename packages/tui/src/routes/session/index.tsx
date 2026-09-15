@@ -63,6 +63,7 @@ import stripAnsi from "strip-ansi"
 import { usePromptRef } from "../../context/prompt"
 import { useEpilogue } from "../../context/epilogue"
 import { normalizePath } from "../../util/path"
+import { DialogPermissions } from "../../component/dialog-permissions"
 import { PermissionPrompt } from "./permission"
 import { QuestionPrompt } from "./question"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
@@ -467,6 +468,13 @@ export function Session() {
   }
 
   const sessionCommandList = createMemo(() => [
+    {
+      title: "Directory permissions",
+      value: "session.permissions",
+      category: "Session",
+      slash: { name: "permissions" },
+      run: () => dialog.replace(() => <DialogPermissions sessionID={route.sessionID} />),
+    },
     {
       title: session()?.share?.url ? "Copy share link" : "Share session",
       value: "session.share",

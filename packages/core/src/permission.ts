@@ -9,6 +9,7 @@ import { AgentV2 } from "./agent"
 import { SessionV2 } from "./session"
 import { SessionStore } from "./session/store"
 import { Wildcard } from "./util/wildcard"
+import { DirectoryGrant } from "./permission/directory"
 import { PermissionSaved } from "./permission/saved"
 
 export { Effect, Rule, Ruleset } from "@opencode-ai/schema/permission"
@@ -45,6 +46,7 @@ export type AssertInput = typeof AssertInput.Type
 export const ReplyInput = Schema.Struct({
   requestID: ID,
   reply: Reply,
+  scope: DirectoryGrant.Scope.pipe(Schema.optional),
   message: Schema.String.pipe(Schema.optional),
 }).annotate({ identifier: "PermissionV2.ReplyInput" })
 export type ReplyInput = typeof ReplyInput.Type
@@ -110,6 +112,7 @@ const layer = Layer.effect(
   Service,
   EffectRuntime.gen(function* () {
     const events = yield* EventV2.Service
+    const grants = yield* DirectoryGrant.Service
     const location = yield* Location.Service
     const agents = yield* AgentV2.Service
     const sessions = yield* SessionStore.Service
@@ -155,7 +158,13 @@ const layer = Layer.effect(
     const evaluateInput = EffectRuntime.fnUntraced(function* (input: AssertInput) {
       const rules = yield* configured(input.sessionID, input.agent)
       if (denied(input, rules)) return { effect: "deny" as const, rules }
-      const all = [...rules, ...(yield* savedRules())]
+      const directories =
+        input.action === "external_directory"
+          ? (yield* grants.list({ sessionID: input.sessionID, projectID: location.project.id })).map(
+              (grant): Permission.Rule => ({ action: "external_directory", resource: grant.pattern, effect: "allow" }),
+            )
+          : []
+      const all = [...rules, ...(yield* savedRules()), ...directories]
       const effects = input.resources.map((resource) => evaluate(input.action, resource, all).effect)
       const effect: Permission.Effect = effects.includes("deny") ? "deny" : effects.includes("ask") ? "ask" : "allow"
       return { effect, rules: all }
@@ -173,6 +182,25 @@ const layer = Layer.effect(
       }
     }
 
+    const reconcileDirectories = EffectRuntime.fn("PermissionV2.reconcileDirectories")(function* () {
+      for (const [id, item] of pending) {
+        if (item.request.action !== "external_directory") continue
+        const result = yield* evaluateInput({ ...item.request, agent: item.agent }).pipe(
+          EffectRuntime.catchTag("Session.NotFoundError", () => EffectRuntime.succeed(undefined)),
+        )
+        if (result?.effect !== "allow" || !pending.delete(id)) continue
+        yield* events
+          .publish(
+            Event.Replied,
+            { sessionID: item.request.sessionID, requestID: id, reply: "always" },
+            { location: { directory: location.directory, workspaceID: location.workspaceID } },
+          )
+          .pipe(EffectRuntime.ensuring(Deferred.succeed(item.deferred, undefined)))
+      }
+    })
+    const unsubscribe = yield* grants.listen(() => reconcileDirectories())
+    yield* EffectRuntime.addFinalizer(() => unsubscribe)
+
     const create = (request: Request, agent?: AgentV2.ID) =>
       EffectRuntime.uninterruptible(
         EffectRuntime.gen(function* () {
@@ -183,6 +211,7 @@ const layer = Layer.effect(
           yield* events
             .publish(Event.Asked, request)
             .pipe(EffectRuntime.onError(() => EffectRuntime.sync(() => pending.delete(request.id))))
+          if (request.action === "external_directory") yield* reconcileDirectories()
           return item
         }),
       )
@@ -222,6 +251,14 @@ const layer = Layer.effect(
         EffectRuntime.gen(function* () {
           const existing = pending.get(input.requestID)
           if (!existing) return yield* new NotFoundError({ requestID: input.requestID })
+          if (input.reply === "always" && input.scope && existing.request.action === "external_directory") {
+            yield* grants.add(
+              { sessionID: existing.request.sessionID, projectID: location.project.id },
+              input.scope,
+              existing.request.save ?? existing.request.resources,
+            )
+            if (!pending.has(input.requestID)) return
+          }
           yield* events.publish(Event.Replied, {
             sessionID: existing.request.sessionID,
             requestID: existing.request.id,
@@ -247,7 +284,11 @@ const layer = Layer.effect(
             return
           }
 
-          if (input.reply === "always" && existing.request.save?.length) {
+          if (
+            input.reply === "always" &&
+            !(input.scope && existing.request.action === "external_directory") &&
+            existing.request.save?.length
+          ) {
             yield* saved.add({
               projectID: location.project.id,
               action: existing.request.action,
@@ -256,7 +297,12 @@ const layer = Layer.effect(
           }
           yield* Deferred.succeed(existing.deferred, undefined)
           pending.delete(input.requestID)
-          if (input.reply !== "always" || !existing.request.save?.length) return
+          if (
+            input.reply !== "always" ||
+            (input.scope && existing.request.action === "external_directory") ||
+            !existing.request.save?.length
+          )
+            return
 
           const rememberedRules = yield* savedRules()
           for (const [id, item] of pending) {
@@ -306,5 +352,5 @@ export const locationLayer = layer.pipe(Layer.provideMerge(AgentV2.locationLayer
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [EventV2.node, Location.node, AgentV2.node, SessionStore.node, PermissionSaved.node],
+  deps: [EventV2.node, Location.node, AgentV2.node, SessionStore.node, PermissionSaved.node, DirectoryGrant.node],
 })

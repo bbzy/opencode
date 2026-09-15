@@ -1,3 +1,5 @@
+import { DirectoryGrant } from "@opencode-ai/schema/directory-grant"
+import { SessionID } from "@opencode-ai/schema/session-id"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Permission } from "@/permission"
 import { Schema } from "effect"
@@ -12,12 +14,26 @@ const root = "/permission"
 const ReplyPayload = Schema.Struct({
   reply: PermissionV1.Reply,
   message: Schema.optional(Schema.String),
+  scope: Schema.optional(DirectoryGrant.Scope),
 })
 
 export const PermissionApi = HttpApi.make("permission")
   .add(
     HttpApiGroup.make("permission")
       .add(
+        HttpApiEndpoint.get("directories", `${root}/directory`, {
+          query: Schema.Struct({ ...WorkspaceRoutingQuery.fields, sessionID: SessionID }),
+          success: Schema.Array(DirectoryGrant.Info),
+        }).annotateMerge(
+          OpenApi.annotations({ identifier: "permission.directories", summary: "List directory grants for a session" }),
+        ),
+        HttpApiEndpoint.delete("revokeDirectory", `${root}/directory/:id`, {
+          params: { id: Schema.String },
+          query: Schema.Struct({ ...WorkspaceRoutingQuery.fields, sessionID: SessionID }),
+          success: Schema.Boolean,
+        }).annotateMerge(
+          OpenApi.annotations({ identifier: "permission.revokeDirectory", summary: "Revoke a directory grant" }),
+        ),
         HttpApiEndpoint.get("list", root, {
           query: WorkspaceRoutingQuery,
           success: described(Schema.Array(PermissionV1.Request), "List of pending permissions"),

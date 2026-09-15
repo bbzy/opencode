@@ -1,3 +1,4 @@
+import { DirectoryGrant } from "@opencode-ai/schema/directory-grant"
 import { Agent } from "@opencode-ai/schema/agent"
 import { Location } from "@opencode-ai/schema/location"
 import { Permission } from "@opencode-ai/schema/permission"
@@ -120,6 +121,7 @@ export const makePermissionGroup = <
         params: { sessionID: Session.ID, requestID: Permission.ID },
         payload: Schema.Struct({
           reply: Permission.Reply,
+          scope: DirectoryGrant.Scope.pipe(Schema.optional),
           message: Schema.String.pipe(Schema.optional),
         }),
         success: HttpApiSchema.NoContent,

@@ -281,6 +281,14 @@ const scenarios: Scenario[] = [
     .status(400),
   http.protected.get("/permission", "permission.list").json(200, array),
   http.protected
+    .get("/permission/directory", "permission.directories")
+    .at((ctx) => ({ path: "/permission/directory?sessionID=ses_httpapi", headers: ctx.headers() }))
+    .json(200, array),
+  http.protected
+    .delete("/permission/directory/{id}", "permission.revokeDirectory")
+    .at((ctx) => ({ path: "/permission/directory/missing?sessionID=ses_httpapi", headers: ctx.headers() }))
+    .json(200),
+  http.protected
     .post("/permission/{requestID}/reply", "permission.reply.invalid")
     .at((ctx) => ({
       path: route("/permission/{requestID}/reply", { requestID: "per_httpapi" }),

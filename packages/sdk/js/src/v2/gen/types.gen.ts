@@ -2052,6 +2052,12 @@ export type Config = {
     preserve_recent_tokens?: number
     reserved?: number
   }
+  refinement?: {
+    auto?: boolean
+    turn_interval?: number
+    cooldown_ms?: number
+    compact?: boolean
+  }
   experimental?: {
     disable_paste_summary?: boolean
     batch_tool?: boolean
@@ -2497,6 +2503,13 @@ export type QuestionNotFoundError = {
   _tag: "QuestionNotFoundError"
   requestID: string
   message: string
+}
+
+export type DirectoryGrant = {
+  id: string
+  scope: "session" | "project" | "global"
+  owner: string
+  pattern: string
 }
 
 export type PermissionRequest = {
@@ -9337,6 +9350,67 @@ export type QuestionRejectResponses = {
 
 export type QuestionRejectResponse = QuestionRejectResponses[keyof QuestionRejectResponses]
 
+export type PermissionDirectoriesData = {
+  body?: never
+  path?: never
+  query: {
+    directory?: string
+    workspace?: string
+    sessionID: string
+  }
+  url: "/permission/directory"
+}
+
+export type PermissionDirectoriesErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type PermissionDirectoriesError = PermissionDirectoriesErrors[keyof PermissionDirectoriesErrors]
+
+export type PermissionDirectoriesResponses = {
+  /**
+   * Success
+   */
+  200: Array<DirectoryGrant>
+}
+
+export type PermissionDirectoriesResponse = PermissionDirectoriesResponses[keyof PermissionDirectoriesResponses]
+
+export type PermissionRevokeDirectoryData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query: {
+    directory?: string
+    workspace?: string
+    sessionID: string
+  }
+  url: "/permission/directory/{id}"
+}
+
+export type PermissionRevokeDirectoryErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type PermissionRevokeDirectoryError = PermissionRevokeDirectoryErrors[keyof PermissionRevokeDirectoryErrors]
+
+export type PermissionRevokeDirectoryResponses = {
+  /**
+   * Success
+   */
+  200: boolean
+}
+
+export type PermissionRevokeDirectoryResponse =
+  PermissionRevokeDirectoryResponses[keyof PermissionRevokeDirectoryResponses]
+
 export type PermissionListData = {
   body?: never
   path?: never
@@ -9369,6 +9443,7 @@ export type PermissionReplyData = {
   body?: {
     reply: "once" | "always" | "reject"
     message?: string
+    scope?: "session" | "project" | "global"
   }
   path: {
     requestID: string
@@ -12846,6 +12921,7 @@ export type V2SessionPermissionGetResponse = V2SessionPermissionGetResponses[key
 export type V2SessionPermissionReplyData = {
   body: {
     reply: PermissionV2Reply
+    scope?: "session" | "project" | "global"
     message?: string
   }
   path: {

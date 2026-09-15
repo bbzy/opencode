@@ -5,6 +5,8 @@ import { Wildcard } from "@opencode-ai/core/util/wildcard"
 import { Cause, Deferred, Effect, Exit, Layer, Context } from "effect"
 import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { DirectoryGrant } from "@opencode-ai/core/permission/directory"
+import { EffectBridge } from "@/effect/bridge"
 import { EventV2Bridge } from "@/event-v2-bridge"
 
 export const Event = PermissionV1.Event
@@ -21,6 +23,7 @@ export interface Interface {
 
 interface PendingEntry {
   info: PermissionV1.Request
+  ruleset: PermissionV1.Ruleset
   deferred: Deferred.Deferred<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>
 }
 
@@ -47,13 +50,35 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const grants = yield* DirectoryGrant.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
-        void ctx
-        const state = {
+        const state: State = {
           pending: new Map<PermissionV1.ID, PendingEntry>(),
           approved: [],
         }
+
+        const reconcile = Effect.fn("Permission.reconcileDirectories")(function* () {
+          for (const [id, item] of state.pending) {
+            if (item.info.permission !== "external_directory") continue
+            const saved = yield* grants.list({ sessionID: item.info.sessionID, projectID: ctx.project.id })
+            if (
+              !item.info.patterns.every(
+                (pattern) =>
+                  evaluate("external_directory", pattern, item.ruleset).action !== "deny" &&
+                  saved.some((grant) => Wildcard.match(pattern, grant.pattern)),
+              )
+            )
+              continue
+            if (!state.pending.delete(id)) continue
+            yield* events
+              .publish(Event.Replied, { sessionID: item.info.sessionID, requestID: id, reply: "always" })
+              .pipe(Effect.ensuring(Deferred.succeed(item.deferred, undefined)))
+          }
+        })
+        const bridge = yield* EffectBridge.make()
+        const unsubscribe = yield* grants.listen(() => bridge.run(reconcile()))
+        yield* Effect.addFinalizer(() => unsubscribe)
 
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
@@ -78,6 +103,11 @@ const layer = Layer.effect(
     const ask = Effect.fn("Permission.ask")(function* (input: AskInput) {
       const { approved, pending } = yield* InstanceState.get(state)
       const { ruleset, unattended, ...request } = input
+      const ctx = yield* InstanceState.context
+      const saved =
+        request.permission === "external_directory"
+          ? yield* grants.list({ sessionID: request.sessionID, projectID: ctx.project.id })
+          : []
       let needsAsk = false
 
       for (const pattern of request.patterns) {
@@ -89,6 +119,7 @@ const layer = Layer.effect(
           })
         }
         if (rule.action === "allow") continue
+        if (saved.some((grant) => Wildcard.match(pattern, grant.pattern))) continue
         needsAsk = true
       }
 
@@ -119,8 +150,19 @@ const layer = Layer.effect(
       yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
 
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
-      pending.set(id, { info, deferred })
+      pending.set(id, { info, deferred, ruleset })
       yield* events.publish(Event.Asked, info)
+      if (request.permission === "external_directory") {
+        const latest = yield* grants.list({ sessionID: request.sessionID, projectID: ctx.project.id })
+        if (
+          request.patterns.every((pattern) => latest.some((grant) => Wildcard.match(pattern, grant.pattern))) &&
+          pending.delete(id)
+        ) {
+          yield* events
+            .publish(Event.Replied, { sessionID: info.sessionID, requestID: id, reply: "always" })
+            .pipe(Effect.ensuring(Deferred.succeed(deferred, undefined)))
+        }
+      }
       return yield* Deferred.await(deferred).pipe(
         Effect.onExit(
           Effect.fnUntraced(function* (
@@ -144,6 +186,15 @@ const layer = Layer.effect(
       const existing = pending.get(input.requestID)
       if (!existing) return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
 
+      if (input.reply === "always" && input.scope && existing.info.permission === "external_directory") {
+        const ctx = yield* InstanceState.context
+        yield* grants.add(
+          { sessionID: existing.info.sessionID, projectID: ctx.project.id },
+          input.scope,
+          existing.info.always,
+        )
+        if (!pending.has(input.requestID)) return
+      }
       pending.delete(input.requestID)
       yield* events.publish(Event.Replied, {
         sessionID: existing.info.sessionID,
@@ -173,7 +224,7 @@ const layer = Layer.effect(
       }
 
       yield* Deferred.succeed(existing.deferred, undefined)
-      if (input.reply === "once") return
+      if (input.reply === "once" || (input.scope && existing.info.permission === "external_directory")) return
 
       for (const pattern of existing.info.always) {
         approved.push({
@@ -251,6 +302,6 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
   return Object.fromEntries(Object.entries(tools).filter(([name]) => !hidden.has(name)))
 }
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node, DirectoryGrant.node] })
 
 export * as Permission from "."

@@ -19,6 +19,7 @@ import { Installation } from "@/installation"
 import { LSP } from "@/lsp/lsp"
 import { MCP } from "@/mcp"
 import { McpAuth } from "@/mcp/auth"
+import { DirectoryGrant } from "@opencode-ai/core/permission/directory"
 import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
 import { PluginPtyEnvironment } from "@/plugin/pty-environment"
@@ -230,6 +231,7 @@ const app = LayerNode.group([
   Discovery.node,
   Question.node,
   Permission.node,
+  DirectoryGrant.node,
   PermissionSaved.node,
   Todo.node,
   Session.node,

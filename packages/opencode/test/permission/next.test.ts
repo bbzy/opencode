@@ -1,3 +1,5 @@
+import { DirectoryGrant } from "@opencode-ai/core/permission/directory"
+import { InstanceState } from "../../src/effect/instance-state"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { test, expect } from "bun:test"
 import os from "os"
@@ -15,7 +17,13 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 
 const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
 const env = AppNodeBuilder.build(
-  LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node]),
+  LayerNode.group([
+    DirectoryGrant.node,
+    Permission.node,
+    EventV2Bridge.node,
+    CrossSpawnSpawner.node,
+    InstanceStore.node,
+  ]),
   [[InstanceStore.bootstrapNode, noopBootstrap]],
 )
 const it = testEffect(env)
@@ -1287,4 +1295,86 @@ it.instance(
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.RejectedError)
     }),
   { git: true },
+)
+
+it.instance(
+  "directory grants unblock matching sessions, preserve isolation and revoke immediately",
+  () =>
+    Effect.gen(function* () {
+      const service = yield* Permission.Service
+      const grants = yield* DirectoryGrant.Service
+      const instance = yield* InstanceState.context
+      const input = {
+        sessionID: SessionID.make("ses_directory_one"),
+        permission: "external_directory",
+        patterns: ["/shared/*"],
+        always: ["/shared/*"],
+        metadata: {},
+        ruleset: [{ permission: "external_directory", pattern: "*", action: "ask" as const }],
+      }
+      const first = yield* service.ask(input).pipe(Effect.forkScoped)
+      const second = yield* service
+        .ask({ ...input, sessionID: SessionID.make("ses_directory_two") })
+        .pipe(Effect.forkScoped)
+      const requests = yield* waitForPending(2)
+      const request = requests.find((item) => item.sessionID === input.sessionID)!
+      yield* service.reply({ requestID: request.id, reply: "always", scope: "session" })
+      yield* Fiber.join(first)
+      expect(yield* service.list()).toHaveLength(1)
+      yield* service.ask(input)
+      const target = { sessionID: input.sessionID, projectID: instance.project.id }
+      const saved = yield* grants.list(target)
+      expect(saved).toHaveLength(1)
+      yield* grants.remove(target, saved[0]!.id)
+      const again = yield* service.ask(input).pipe(Effect.forkScoped)
+      yield* waitForPending(2)
+      yield* grants.add(target, "project", ["/shared/*"])
+      yield* Fiber.join(again)
+      yield* Fiber.join(second)
+      expect(yield* service.list()).toEqual([])
+      expect(
+        yield* fail(
+          service.ask({ ...input, ruleset: [{ permission: "external_directory", pattern: "*", action: "deny" }] }),
+        ),
+      ).toBeInstanceOf(PermissionV1.DeniedError)
+    }),
+  { git: true },
+)
+
+it.live("global directory grants resolve requests in their owning instances and survive instance reload", () =>
+  Effect.gen(function* () {
+    const one = yield* tmpdirScoped({ git: true })
+    const two = yield* tmpdirScoped({ git: true })
+    const store = yield* InstanceStore.Service
+    const events = yield* EventV2Bridge.Service
+    const replies: { id: string; directory?: string }[] = []
+    const unsubscribe = yield* events.listen((event) =>
+      Effect.sync(() => {
+        if (event.type !== Permission.Event.Replied.type) return
+        replies.push({ id: (event.data as { requestID: string }).requestID, directory: event.location?.directory })
+      }),
+    )
+    yield* Effect.addFinalizer(() => unsubscribe)
+    const input = {
+      sessionID: SessionID.make("ses_global_directory"),
+      permission: "external_directory",
+      patterns: ["/global-shared/*"],
+      always: ["/global-shared/*"],
+      metadata: {},
+      ruleset: [],
+    }
+    const first = yield* store.provide({ directory: one }, ask(input)).pipe(Effect.forkScoped)
+    const second = yield* store
+      .provide({ directory: two }, ask({ ...input, sessionID: SessionID.make("ses_other_directory") }))
+      .pipe(Effect.forkScoped)
+    const requests = yield* store.provide({ directory: one }, waitForPending(1))
+    yield* store.provide({ directory: two }, waitForPending(1))
+    yield* store.provide({ directory: one }, reply({ requestID: requests[0]!.id, reply: "always", scope: "global" }))
+    yield* Fiber.join(first)
+    yield* Fiber.join(second)
+    expect(replies.map((item) => item.directory).sort()).toEqual([one, two].sort())
+    yield* store.reload({ directory: one })
+    yield* store.provide({ directory: one }, ask(input))
+    expect(yield* store.provide({ directory: one }, list())).toEqual([])
+  }),
 )

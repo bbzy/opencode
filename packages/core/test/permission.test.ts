@@ -8,6 +8,7 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { Location } from "@opencode-ai/core/location"
 import { PermissionV2 } from "@opencode-ai/core/permission"
 import { PermissionTable } from "@opencode-ai/core/permission/sql"
+import { DirectoryGrant } from "@opencode-ai/core/permission/directory"
 import { PermissionSaved } from "@opencode-ai/core/permission/saved"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
@@ -30,6 +31,7 @@ const it = testEffect(
       EventV2.node,
       SessionStore.node,
       PermissionSaved.node,
+      DirectoryGrant.node,
       AgentV2.node,
       PermissionV2.node,
     ]),
@@ -313,3 +315,49 @@ describe("PermissionV2", () => {
     }),
   )
 })
+
+it.effect("directory grants isolate scopes, deduplicate and revoke without touching other scopes", () =>
+  Effect.gen(function* () {
+    const grants = yield* DirectoryGrant.Service
+    const target = { sessionID: "ses_one", projectID: "project_one" }
+    yield* grants.add(target, "session", ["/session/*", "/session/*"])
+    yield* grants.add(target, "project", ["/project/*"])
+    yield* grants.add(target, "global", ["/global/*"])
+    expect((yield* grants.list(target)).map((entry) => entry.scope).sort()).toEqual(["global", "project", "session"])
+    expect((yield* grants.list({ ...target, sessionID: "ses_two" })).map((entry) => entry.scope).sort()).toEqual([
+      "global",
+      "project",
+    ])
+    expect(
+      (yield* grants.list({ sessionID: "ses_three", projectID: "project_two" })).map((entry) => entry.scope),
+    ).toEqual(["global"])
+    const session = (yield* grants.list(target)).find((entry) => entry.scope === "session")!
+    yield* grants.remove({ ...target, sessionID: "ses_two" }, session.id)
+    expect((yield* grants.list(target)).length).toBe(3)
+    yield* grants.remove(target, session.id)
+    expect((yield* grants.list(target)).length).toBe(2)
+  }),
+)
+
+it.effect("directory approval unblocks pending V2 requests and revocation takes effect immediately", () =>
+  Effect.gen(function* () {
+    yield* setup()
+    const service = yield* PermissionV2.Service
+    const grants = yield* DirectoryGrant.Service
+    const input = assertion({ action: "external_directory", resources: ["/shared/*"], save: ["/shared/*"] })
+    expect((yield* service.ask(input)).effect).toBe("ask")
+    yield* service.reply({ requestID: input.id, reply: "always", scope: "session" })
+    expect(yield* service.list()).toEqual([])
+    expect((yield* service.ask(input)).effect).toBe("allow")
+    const target = { sessionID: input.sessionID, projectID: Project.ID.global }
+    const rows = yield* grants.list(target)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.scope).toBe("session")
+    yield* grants.remove(target, rows[0]!.id)
+    expect((yield* service.ask(input)).effect).toBe("ask")
+    yield* grants.add(target, "global", ["/shared/*"])
+    expect(yield* service.list()).toEqual([])
+    yield* setRules([{ action: "external_directory", resource: "*", effect: "deny" }])
+    expect((yield* service.ask(input)).effect).toBe("deny")
+  }),
+)

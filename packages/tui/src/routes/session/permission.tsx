@@ -19,7 +19,7 @@ import { usePathFormatter } from "../../context/path-format"
 import { useToast } from "../../ui/toast"
 import { errorMessage, errorNamed } from "../../util/error"
 
-type PermissionStage = "permission" | "always" | "reject"
+type PermissionStage = "permission" | "always" | "reject" | "directory"
 
 function EditBody(props: { request: PermissionRequest }) {
   const themeState = useTheme()
@@ -117,6 +117,7 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
   const toast = useToast()
   const [store, setStore] = createStore({
     stage: "permission" as PermissionStage,
+    saving: "",
   })
   const pathFormatter = usePathFormatter()
 
@@ -134,7 +135,7 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
   // The generated client resolves with { error } for HTTP errors and only
   // rejects for transport failures, so both channels must be handled.
   function report(title: string, promise: Promise<{ error?: unknown }>) {
-    void promise
+    return promise
       .then((result) => {
         if (!result.error) return
         if (dismissStale(result.error)) return
@@ -161,6 +162,43 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
 
   return (
     <Switch>
+      <Match when={store.stage === "directory"}>
+        <Prompt
+          title="Allow directory access"
+          body={
+            <box paddingLeft={1} gap={1}>
+              <TextBody title="Choose where to remember this approval. Manage saved approvals with /permissions." />
+              <For each={props.request.always}>{(pattern) => <text fg={theme.text}>{pattern}</text>}</For>
+              <Show when={store.saving}>
+                <TextBody title={`Saving approval for ${store.saving}…`} />
+              </Show>
+            </box>
+          }
+          options={{ session: "This session", project: "This project", global: "Every project", cancel: "Cancel" }}
+          escapeKey="cancel"
+          onSelect={(scope) => {
+            if (store.saving) return
+            if (scope === "cancel") {
+              setStore("stage", "permission")
+              return
+            }
+            setStore(
+              "saving",
+              scope === "session" ? "this session" : scope === "project" ? "this project" : "every project",
+            )
+            void report(
+              "Failed to grant directory access",
+              sdk.client.permission.reply({
+                reply: "always",
+                scope,
+                requestID: props.request.id,
+                directory: props.directory,
+                workspace: project.workspace.current(),
+              }),
+            ).finally(() => setStore({ stage: "permission", saving: "" }))
+          }}
+        />
+      </Match>
       <Match when={store.stage === "always"}>
         <Prompt
           title="Always allow"
@@ -434,12 +472,16 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
               title="Permission required"
               header={header()}
               body={current.body}
-              options={{ once: "Allow once", always: "Allow always", reject: "Reject" }}
+              options={{
+                once: "Allow once",
+                always: props.request.permission === "external_directory" ? "Remember…" : "Allow always",
+                reject: "Reject",
+              }}
               escapeKey="reject"
               fullscreen
               onSelect={(option) => {
                 if (option === "always") {
-                  setStore("stage", "always")
+                  setStore("stage", props.request.permission === "external_directory" ? "directory" : "always")
                   return
                 }
                 if (option === "reject") {
