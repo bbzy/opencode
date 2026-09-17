@@ -3524,6 +3524,42 @@ it.instance(
 )
 
 it.instance(
+  "ordinary session waits beyond the unattended stream stall timeout",
+  () =>
+    Effect.gen(function* () {
+      const originalTimeout = SessionProcessor.processorConfig.stallTimeoutMs
+      const originalCheck = SessionProcessor.processorConfig.stallCheckMs
+      SessionProcessor.processorConfig.stallTimeoutMs = 200
+      SessionProcessor.processorConfig.stallCheckMs = 50
+      try {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const { prompt, sessions, chat } = yield* boot()
+        const status = yield* SessionStatus.Service
+        yield* llm.hang
+        yield* user(chat.id, "hello")
+        const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+        yield* llm.wait(1)
+        yield* waitForBusy(chat.id)
+
+        // Let the real stall deadline and several watchdog checks pass.
+        yield* Effect.sleep("600 millis")
+        expect((yield* status.get(chat.id)).type).toBe("busy")
+        const messages = yield* sessions.messages({ sessionID: chat.id })
+        const assistant = messages.findLast((message) => message.info.role === "assistant")
+        expect(assistant?.info.role).toBe("assistant")
+        if (assistant?.info.role === "assistant") expect(assistant.info.error).toBeUndefined()
+
+        yield* prompt.cancel(chat.id)
+        expect(Exit.isSuccess(yield* Fiber.await(fiber))).toBe(true)
+      } finally {
+        SessionProcessor.processorConfig.stallTimeoutMs = originalTimeout
+        SessionProcessor.processorConfig.stallCheckMs = originalCheck
+      }
+    }),
+  { config: cfg },
+)
+
+it.instance(
   "/cycle records a stalled round and schedules the next idle-anchored attempt",
   () =>
     Effect.gen(function* () {

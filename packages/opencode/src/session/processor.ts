@@ -30,8 +30,8 @@ const DOOM_LOOP_THRESHOLD = 3
 
 // Guardrails against runaway turns. Mutable so tests can shrink them.
 export const processorConfig = {
-  // A stream producing no events for this long (with no tool execution in
-  // flight) is treated as hung: the turn fails instead of waiting forever.
+  // An unattended stream producing no events for this long (with no tool
+  // execution in flight) fails instead of waiting forever.
   stallTimeoutMs: 10 * 60 * 1000,
   stallCheckMs: 30 * 1000,
   // A non-interactive unattended tool can keep the stream alive forever while
@@ -719,6 +719,7 @@ const layer = Layer.effect(
             // error). Tool executions can legitimately run for a long time
             // with no stream events in between, so those windows are exempt.
             const stallWatch = Effect.gen(function* () {
+              if (!ctx.unattended) return yield* Effect.never
               while (true) {
                 yield* Effect.sleep(Duration.millis(processorConfig.stallCheckMs))
                 const tools = Object.values(ctx.toolcalls)
