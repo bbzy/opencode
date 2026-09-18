@@ -18,7 +18,8 @@ settle, before the next provider request.
 ```
 
 `--global` also applies to list, history, rollback, and export. With no scope
-argument, learned state belongs to the current session. Explicit global entries
+argument, the learned ledger belongs to the current session. Skill files are
+automatically published to the shared skill directory regardless of ledger scope. Explicit global entries
 are shared across sessions. Local entries override global entries with the same
 kind and identifier. Forked sessions start with their own local state.
 
@@ -92,15 +93,24 @@ Each file contains entries and their complete before/after change history. Write
 use file locks and atomic replacement. A stale proposal is rejected if an entry
 changed while the model was planning. Rollback refuses to overwrite later edits.
 
-A learned skill is initially a ledger entry. `/refine export <skill-id>` writes it
-as `~/.config/opencode/refine/skills/<skill-id>/SKILL.md` by default. Both local and
-global ledger entries export to this dedicated directory, separate from ordinary
-skills. The path follows the configured global opencode directory, including
-XDG_CONFIG_HOME or OPENCODE_CONFIG_DIR overrides. `--global` selects the source
-ledger only. Both skill loaders discover this directory automatically. Restart opencode to refresh standard skill
-discovery after export. Existing different files are not overwritten: inspect and
-update those through ordinary file editing. Exported files are independent of the
-ledger, so ledger rollback does not remove or rewrite them.
+Skill creates and updates automatically write standard files to
+`~/.config/opencode/refine/skills/<skill-id>/SKILL.md`. New sessions can discover
+and load these skills immediately, without manual export or restarting opencode.
+Both loaders refresh this directory when listing skills. Ordinary skills retain
+precedence over learned skills with the same name. Project-specific procedures
+should identify their project in their description and instructions.
+
+The path follows the configured global opencode directory, including
+XDG_CONFIG_HOME or OPENCODE_CONFIG_DIR overrides. Ledger scope selects the source
+record only; both local and global skills publish to this shared directory.
+Updates replace the previous generated content; deletion and rollback synchronize
+the file as well. Existing conflicting files, including manual edits and different
+skills from another session with the same ID, cause the operation to fail before
+changing the ledger. Skill files use atomic replacement, but multiple skill files
+and the ledger are not a single filesystem transaction.
+
+`/refine export <skill-id>` remains available to publish older ledger entries.
+Existing different files are not overwritten by this explicit export.
 
 The legacy command handler performs management directly. V2 exposes the same
 operations through the built-in command template and `memory` tool; a requested

@@ -8,13 +8,15 @@ import { ConfigMarkdown } from "@opencode-ai/core/config/markdown"
 import { Refinement } from "@opencode-ai/core/refinement"
 import { RefinementRunner } from "@opencode-ai/core/refinement/runner"
 import { RefinementMemory } from "@opencode-ai/core/refinement/memory"
+import { SkillV2 } from "@opencode-ai/core/skill"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
 
 const directory = await tmpdir()
 afterAll(() => directory[Symbol.asyncDispose]())
 const it = testEffect(
-  AppNodeBuilder.build(LayerNode.group([RefinementRunner.node, Refinement.node]), [
+  AppNodeBuilder.build(LayerNode.group([RefinementRunner.node, Refinement.node, SkillV2.node]), [
     [Global.node, Global.layerWith({ data: directory.path, config: path.join(directory.path, "config") })],
   ]),
 )
@@ -34,6 +36,43 @@ const proposal: Refinement.Proposal = {
 }
 
 describe("Refinement ledger", () => {
+  it.live("publishes skills across sessions and refreshes discovery on update and rollback", () =>
+    Effect.gen(function* () {
+      const store = yield* Refinement.Service
+      const skills = yield* SkillV2.Service
+      const target = { sessionID: "publisher", scope: "local" as const }
+      const edit = { ...proposal.edits[0]!, kind: "skill" as const, id: "published-skill" }
+      yield* skills.transform((draft) =>
+        draft.source({
+          type: "directory",
+          path: AbsolutePath.make(path.dirname(path.dirname(store.exportPath(edit.id)))),
+        }),
+      )
+      expect(yield* skills.list()).toEqual([])
+      const created = yield* store.apply(target, { ...proposal, edits: [edit] })
+      expect((yield* skills.list()).find((entry) => entry.name === edit.id)?.content.trim()).toBe(edit.content!)
+      expect((yield* store.read({ ...target, sessionID: "new-session" })).entries).toEqual([])
+      const updated = yield* store.apply(target, {
+        ...proposal,
+        edits: [{ ...edit, action: "update", content: "Updated procedure" }],
+      })
+      expect((yield* skills.list()).find((entry) => entry.name === edit.id)?.content.trim()).toBe("Updated procedure")
+      yield* store.rollback(target, updated.history.at(-1)!.id)
+      expect((yield* skills.list()).find((entry) => entry.name === edit.id)?.content.trim()).toBe(edit.content!)
+      yield* Effect.promise(() => Bun.write(store.exportPath(edit.id), "Manual edit"))
+      expect(Exit.isFailure(yield* store.rollback(target, created.history[0]!.id).pipe(Effect.exit))).toBe(true)
+      expect((yield* store.read(target)).entries).toHaveLength(1)
+      yield* Effect.promise(() =>
+        Bun.write(
+          store.exportPath(edit.id),
+          `---\nname: ${edit.id}\ndescription: ${JSON.stringify(edit.title)}\n---\n\n${edit.content}\n`,
+        ),
+      )
+      yield* store.rollback(target, created.history[0]!.id)
+      expect((yield* skills.list()).find((entry) => entry.name === edit.id)).toBeUndefined()
+    }),
+  )
+
   test("large memories cannot hide later entries or truncate the context wrapper", () => {
     const state = Refinement.apply(empty, {
       summary: "Context budget",
@@ -136,6 +175,7 @@ describe("Refinement ledger", () => {
       expect((yield* store.read({ ...target, sessionID: "other" })).entries).toEqual([])
       expect((yield* store.read({ ...target, scope: "global" })).entries).toEqual([])
       yield* store.apply(target, { ...proposal, edits: [{ ...proposal.edits[0]!, kind: "skill" }] })
+      expect(yield* Effect.promise(() => Bun.file(store.exportPath("package-tests")).exists())).toBe(true)
       const exported = yield* store.exportSkill(target, "package-tests")
       expect(exported).toBe(path.join(directory.path, "config", "refine", "skills", "package-tests", "SKILL.md"))
       yield* store.apply(

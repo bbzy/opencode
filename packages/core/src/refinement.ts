@@ -169,6 +169,10 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Re
 const decode = Schema.decodeUnknownOption(Schema.UnknownFromJsonString.pipe(Schema.decodeTo(State)))
 const failure = (error: unknown) => (error instanceof Error ? error : new Error({ message: String(error) }))
 
+function skillFile(entry: Entry) {
+  return `---\nname: ${entry.id}\ndescription: ${JSON.stringify(entry.title)}\n---\n\n${entry.content}\n`
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -196,6 +200,31 @@ const layer = Layer.effect(
         const current = yield* read(target)
         const next = yield* Effect.try({ try: () => change(current), catch: failure })
         if (next === current) return next
+        const skills = next.history.at(-1)!.changes.filter((change) => change.kind === "skill")
+        // Lock and validate every destination before publishing any skill or ledger change.
+        for (const change of skills.toSorted((a, b) => a.id.localeCompare(b.id))) {
+          const destination = exportPath(change.id)
+          yield* Flock.effect(destination, { dir: path.join(global.data, "refinement", "locks") })
+          const previous = yield* fs.readFileStringSafe(destination)
+          if (
+            previous !== undefined &&
+            previous !== (change.before && skillFile(change.before)) &&
+            previous !== (change.after && skillFile(change.after))
+          )
+            return yield* new Error({
+              message: `Skill file already exists or was edited; review it first: ${destination}`,
+            })
+        }
+        for (const change of skills) {
+          const destination = exportPath(change.id)
+          if (!change.after) {
+            yield* fs.remove(destination, { force: true })
+            continue
+          }
+          const temp = `${destination}.${crypto.randomUUID()}.tmp`
+          yield* fs.writeWithDirs(temp, skillFile(change.after), 0o600)
+          yield* fs.rename(temp, destination).pipe(Effect.ensuring(fs.remove(temp).pipe(Effect.ignore)))
+        }
         const temp = `${file(target)}.${crypto.randomUUID()}.tmp`
         yield* fs.writeWithDirs(temp, JSON.stringify(next), 0o600)
         yield* fs.rename(temp, file(target)).pipe(Effect.ensuring(fs.remove(temp).pipe(Effect.ignore)))
@@ -215,7 +244,7 @@ const layer = Layer.effect(
           if (!entry) return yield* new Error({ message: `Skill entry not found: ${id}` })
           const destination = exportPath(entry.id)
           yield* Flock.effect(destination, { dir: path.join(global.data, "refinement", "locks") })
-          const content = `---\nname: ${entry.id}\ndescription: ${JSON.stringify(entry.title)}\n---\n\n${entry.content}\n`
+          const content = skillFile(entry)
           const previous = yield* fs.readFileStringSafe(destination)
           if (previous !== undefined && previous !== content)
             return yield* new Error({

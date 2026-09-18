@@ -74,6 +74,10 @@ describe("skill", () => {
       yield* Effect.addFinalizer(() =>
         Effect.promise(() => fs.rm(path.dirname(file), { recursive: true, force: true })),
       )
+      yield* Effect.gen(function* () {
+        const skill = yield* Skill.Service
+        expect((yield* skill.all()).find((entry) => entry.name === "refined-procedure")).toBeUndefined()
+      }).pipe(provideInstance(tmp.path))
       yield* Effect.promise(async () => {
         await fs.mkdir(path.dirname(file), { recursive: true })
         await Bun.write(
@@ -84,6 +88,12 @@ describe("skill", () => {
       yield* Effect.gen(function* () {
         const skill = yield* Skill.Service
         expect((yield* skill.all()).find((entry) => entry.name === "refined-procedure")?.location).toBe(file)
+        yield* Effect.promise(() =>
+          Bun.write(file, "---\nname: refined-procedure\ndescription: Updated\n---\nUpdated procedure"),
+        )
+        expect((yield* skill.require("refined-procedure")).content.trim()).toBe("Updated procedure")
+        yield* Effect.promise(() => fs.rm(file))
+        expect(yield* skill.get("refined-procedure")).toBeUndefined()
       }).pipe(provideInstance(tmp.path))
     }),
   )

@@ -7,6 +7,7 @@ import { Skill } from "@opencode-ai/schema/skill"
 import { AgentV2 } from "./agent"
 import { ConfigMarkdown } from "./config/markdown"
 import { FSUtil } from "./fs-util"
+import { Global } from "./global"
 import { PermissionV2 } from "./permission"
 import { AbsolutePath } from "./schema"
 import { SkillDiscovery } from "./skill/discovery"
@@ -58,6 +59,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const discovery = yield* SkillDiscovery.Service
     const fs = yield* FSUtil.Service
+    const global = yield* Global.Service
 
     const state = State.create<Data, Draft>({
       initial: () => ({ sources: [] }),
@@ -111,7 +113,8 @@ const layer = Layer.effect(
       const skills = new Map<string, Info>()
       for (const source of state.get().sources) {
         const key = Source.key(source)
-        const loaded = cache.get(key) ?? (yield* load(source))
+        const learned = source.type === "directory" && source.path === path.join(global.config, "refine", "skills")
+        const loaded = (learned ? undefined : cache.get(key)) ?? (yield* load(source))
         cache.set(key, loaded)
         for (const skill of loaded) skills.set(skill.name, skill)
       }
@@ -129,4 +132,4 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = makeLocationNode({ service: Service, layer, deps: [SkillDiscovery.node, FSUtil.node] })
+export const node = makeLocationNode({ service: Service, layer, deps: [SkillDiscovery.node, FSUtil.node, Global.node] })

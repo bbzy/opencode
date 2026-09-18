@@ -212,7 +212,6 @@ const discoverSkills = Effect.fnUntraced(function* (
   }
 
   const configDirs = yield* config.directories()
-  yield* scan(state, path.join(global.config, "refine"), EXTERNAL_SKILL_PATTERN, { scope: "refine" })
   for (const dir of configDirs) {
     yield* scan(state, dir, OPENCODE_SKILL_PATTERN)
   }
@@ -308,29 +307,38 @@ const layer = Layer.effect(
       }),
     )
 
+    const current = Effect.fn("Skill.current")(function* () {
+      const learned: State = { skills: {}, dirs: new Set() }
+      const discovered: ScanState = { matches: new Set(), dirs: new Set() }
+      yield* scan(discovered, path.join(global.config, "refine"), EXTERNAL_SKILL_PATTERN, { scope: "refine" })
+      yield* Effect.forEach(discovered.matches, (match) => add(learned, match, events), { discard: true })
+      const base = yield* InstanceState.get(state)
+      return { skills: { ...learned.skills, ...base.skills }, dirs: new Set([...learned.dirs, ...base.dirs]) }
+    })
+
     const get = Effect.fn("Skill.get")(function* (name: string) {
-      const s = yield* InstanceState.get(state)
+      const s = yield* current()
       return s.skills[name]
     })
 
     const require = Effect.fn("Skill.require")(function* (name: string) {
-      const s = yield* InstanceState.get(state)
+      const s = yield* current()
       const info = s.skills[name]
       if (info) return info
       return yield* new NotFoundError({ name, available: Object.keys(s.skills).toSorted() })
     })
 
     const all = Effect.fn("Skill.all")(function* () {
-      const s = yield* InstanceState.get(state)
+      const s = yield* current()
       return Object.values(s.skills)
     })
 
     const dirs = Effect.fn("Skill.dirs")(function* () {
-      return (yield* InstanceState.get(discovered)).dirs
+      return Array.from((yield* current()).dirs)
     })
 
     const available = Effect.fn("Skill.available")(function* (agent?: Agent.Info) {
-      const s = yield* InstanceState.get(state)
+      const s = yield* current()
       const list = Object.values(s.skills).toSorted((a, b) => a.name.localeCompare(b.name))
       if (!agent) return list
       return list.filter((skill) => Permission.evaluate("skill", skill.name, agent.permission).action !== "deny")
